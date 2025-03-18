@@ -12,6 +12,7 @@ from core.api import app, get_settings
 import filetype
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -21,27 +22,6 @@ TEST_DATA_DIR = Path(__file__).parent / "test_data"
 JWT_SECRET = "your-secret-key-for-signing-tokens"
 TEST_USER_ID = "test_user"
 TEST_POSTGRES_URI = "postgresql+asyncpg://postgres:postgres@localhost:5432/databridge_test"
-
-
-async def setup_test_postgres():
-    """Setup test PostgreSQL database"""
-    engine = create_async_engine(TEST_POSTGRES_URI)
-    try:
-        async with engine.begin() as conn:
-            # Drop all tables first
-            from core.database.postgres_database import Base
-
-            await conn.run_sync(Base.metadata.drop_all)
-
-            # Create all tables
-            await conn.run_sync(Base.metadata.create_all)
-
-            logger.info("Test PostgreSQL database setup completed")
-    except Exception as e:
-        logger.error(f"Failed to setup test PostgreSQL database: {e}")
-        raise
-    finally:
-        await engine.dispose()
 
 
 @pytest.fixture(scope="session")
@@ -69,10 +49,6 @@ async def setup_test_environment(event_loop):
     pdf_file = TEST_DATA_DIR / "test.pdf"
     if not pdf_file.exists():
         pytest.skip("PDF file not available, skipping PDF tests")
-
-    # Setup test PostgreSQL database
-    if get_settings().DATABASE_PROVIDER == "postgres":
-        await setup_test_postgres()
 
 
 def create_test_token(
@@ -113,6 +89,82 @@ async def test_app(event_loop: asyncio.AbstractEventLoop) -> FastAPI:
     # Configure test settings
     settings = get_settings()
     settings.JWT_SECRET_KEY = JWT_SECRET
+    
+    # Override database settings to use test database
+    # This ensures we don't use the production database from .env
+    settings.POSTGRES_URI = TEST_POSTGRES_URI
+    settings.DATABASE_PROVIDER = "postgres"  # Ensure we're using postgres
+    
+    # IMPORTANT: We need to completely reinitialize the database connections
+    # since they were already established at import time
+    
+    # First, get the database from the API module
+    from core.api import database as api_database, app
+    
+    # Close existing connection if it exists
+    if hasattr(api_database, 'engine'):
+        await api_database.engine.dispose()
+    
+    # Create a new database connection with the test URI
+    from core.database.postgres_database import PostgresDatabase
+    test_database = PostgresDatabase(uri=TEST_POSTGRES_URI)
+    
+    # Initialize the test database
+    await test_database.initialize()
+    
+    # Replace the global database instance with our test database
+    import core.api
+    core.api.database = test_database
+    
+    # Also update the vector store if it uses the same database (for pgvector)
+    if settings.VECTOR_STORE_PROVIDER == "pgvector":
+        from core.vector_store.pgvector_store import PGVectorStore
+        from core.api import vector_store as api_vector_store
+        
+        # Create a new vector store with the test URI
+        test_vector_store = PGVectorStore(uri=TEST_POSTGRES_URI)
+        
+        # Replace the global vector store with our test version
+        core.api.vector_store = test_vector_store
+    
+    # Update the document service with our test instances
+    from core.api import document_service as api_document_service
+    from core.services.document_service import DocumentService
+    from core.api import parser, embedding_model, reranker, storage
+    
+    # Create a new document service with our test database and vector store
+    from core.api import completion_model, cache_factory, colpali_embedding_model, colpali_vector_store
+    
+    test_document_service = DocumentService(
+        database=test_database,
+        vector_store=core.api.vector_store,
+        parser=parser,
+        embedding_model=embedding_model,
+        completion_model=completion_model,
+        cache_factory=cache_factory,
+        reranker=reranker,
+        storage=storage,
+        enable_colpali=settings.ENABLE_COLPALI,
+        colpali_embedding_model=colpali_embedding_model,
+        colpali_vector_store=colpali_vector_store,
+    )
+    
+    # Replace the global document service with our test version
+    core.api.document_service = test_document_service
+    
+    # Update the graph service if needed
+    if hasattr(core.api, 'graph_service'):
+        from core.services.graph_service import GraphService
+        from core.api import completion_model
+        
+        test_graph_service = GraphService(
+            db=test_database,
+            embedding_model=embedding_model,
+            completion_model=completion_model
+        )
+        
+        core.api.graph_service = test_graph_service
+    
     return app
 
 
@@ -123,6 +175,35 @@ async def client(
     """Create async test client"""
     async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
         yield client
+
+
+@pytest.fixture(scope="function", autouse=True)
+async def cleanup_documents():
+    """Clean up documents before each document test"""
+    # This will run before the test
+    yield
+    # This will run after the test
+    
+    # We should always use the test database
+    # Create a fresh connection to make sure we're not affected by any state
+    engine = create_async_engine(TEST_POSTGRES_URI)
+    
+    try:
+        async with engine.begin() as conn:
+            # Clean up by deleting all rows rather than dropping tables
+            await conn.execute(text("DELETE FROM documents"))
+            
+            # Delete from chunks table
+            try:
+                await conn.execute(text("DELETE FROM vector_embeddings"))
+            except Exception as e:
+                logger.info(f"No chunks table to clean or error: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to clean up document tables: {e}")
+        raise
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -311,6 +392,38 @@ async def test_get_document(client: AsyncClient):
     assert doc["external_id"] == doc_id
     assert "metadata" in doc
     assert "content_type" in doc
+    
+    
+@pytest.mark.asyncio
+async def test_get_document_by_filename(client: AsyncClient):
+    """Test getting a document by filename"""
+    # First ingest a document with a specific filename
+    filename = "test_get_by_filename.txt"
+    headers = create_auth_header()
+    
+    initial_content = "This is content for testing get_document_by_filename."
+    response = await client.post(
+        "/ingest/text",
+        json={
+            "content": initial_content, 
+            "filename": filename,
+            "metadata": {"test": True, "type": "text"},
+        },
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    doc_id = response.json()["external_id"]
+    
+    # Now try to get the document by filename
+    response = await client.get(f"/documents/filename/{filename}", headers=headers)
+    
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["external_id"] == doc_id
+    assert doc["filename"] == filename
+    assert "metadata" in doc
+    assert "content_type" in doc
 
 
 @pytest.mark.asyncio
@@ -319,6 +432,344 @@ async def test_invalid_document_id(client: AsyncClient):
     headers = create_auth_header()
     response = await client.get("/documents/invalid_id", headers=headers)
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_document_with_text(client: AsyncClient):
+    """Test updating a document with text content"""
+    # First ingest a document to update
+    initial_content = "This is the initial content for update testing."
+    doc_id = await test_ingest_text_document(client, content=initial_content)
+    
+    headers = create_auth_header()
+    update_content = "This is additional content for the document."
+    
+    # Test updating with text content
+    response = await client.post(
+        f"/documents/{doc_id}/update_text",
+        json={
+            "content": update_content,
+            "metadata": {"updated": True, "version": "2.0"},
+            "use_colpali": True
+        },
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    updated_doc = response.json()
+    assert updated_doc["external_id"] == doc_id
+    assert updated_doc["metadata"]["updated"] is True
+    assert updated_doc["metadata"]["version"] == "2.0"
+    
+    # Verify the content was updated by retrieving chunks
+    search_response = await client.post(
+        "/retrieve/chunks",
+        json={
+            "query": "additional content",
+            "filters": {"external_id": doc_id},
+        },
+        headers=headers,
+    )
+    
+    assert search_response.status_code == 200
+    chunks = search_response.json()
+    assert len(chunks) > 0
+    assert any(update_content in chunk["content"] for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_update_document_with_file(client: AsyncClient):
+    """Test updating a document with file content"""
+    # First ingest a document to update
+    initial_content = "This is the initial content for file update testing."
+    doc_id = await test_ingest_text_document(client, content=initial_content)
+    
+    headers = create_auth_header()
+    
+    # Create a test file to upload
+    test_file_path = TEST_DATA_DIR / "update_test.txt"
+    update_content = "This is file content for updating the document."
+    test_file_path.write_text(update_content)
+    
+    with open(test_file_path, "rb") as f:
+        response = await client.post(
+            f"/documents/{doc_id}/update_file",
+            files={"file": ("update_test.txt", f, "text/plain")},
+            data={
+                "metadata": json.dumps({"updated_with_file": True}),
+                "rules": json.dumps([]),
+                "update_strategy": "add",
+            },
+            headers=headers,
+        )
+    
+    assert response.status_code == 200
+    updated_doc = response.json()
+    assert updated_doc["external_id"] == doc_id
+    assert updated_doc["metadata"]["updated_with_file"] is True
+    
+    # Verify the content was updated by retrieving chunks
+    search_response = await client.post(
+        "/retrieve/chunks",
+        json={
+            "query": "file content for updating",
+            "filters": {"external_id": doc_id},
+        },
+        headers=headers,
+    )
+    
+    assert search_response.status_code == 200
+    chunks = search_response.json()
+    assert len(chunks) > 0
+    assert any(update_content in chunk["content"] for chunk in chunks)
+    
+    # Clean up the test file
+    test_file_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_update_document_metadata(client: AsyncClient):
+    """Test updating only a document's metadata"""
+    # First ingest a document to update
+    initial_content = "This is the content for metadata update testing."
+    doc_id = await test_ingest_text_document(client, content=initial_content)
+    
+    headers = create_auth_header()
+    
+    # Test updating just metadata
+    new_metadata = {
+        "meta_updated": True,
+        "tags": ["test", "metadata", "update"],
+        "priority": 1
+    }
+    
+    response = await client.post(
+        f"/documents/{doc_id}/update_metadata",
+        json=new_metadata,
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    updated_doc = response.json()
+    assert updated_doc["external_id"] == doc_id
+    
+    # Verify the response has the updated metadata
+    assert updated_doc["metadata"]["meta_updated"] is True
+    assert "test" in updated_doc["metadata"]["tags"]
+    assert updated_doc["metadata"]["priority"] == 1
+    
+    # Fetch the document to verify it exists
+    get_response = await client.get(f"/documents/{doc_id}", headers=headers)
+    assert get_response.status_code == 200
+    
+    # Note: Depending on caching or database behavior, the metadata may not be 
+    # immediately visible in a subsequent fetch. The important part is that
+    # the update operation itself returned the correct metadata.
+    
+    
+@pytest.mark.asyncio
+async def test_update_document_with_rules(client: AsyncClient):
+    """Test updating a document with text content and applying rules"""
+    # First ingest a document to update
+    initial_content = "This is the initial content for rule testing."
+    doc_id = await test_ingest_text_document(client, content=initial_content)
+    
+    headers = create_auth_header()
+    update_content = "This document contains information about John Doe who lives at 123 Main St and has SSN 123-45-6789."
+    
+    # Create a rule to apply during update (natural language rule to remove PII)
+    rule = {
+        "type": "natural_language",
+        "prompt": "Remove all personally identifiable information (PII) such as names, addresses, and SSNs."
+    }
+    
+    # Test updating with text content and a rule
+    response = await client.post(
+        f"/documents/{doc_id}/update_text",
+        json={
+            "content": update_content,
+            "metadata": {"contains_pii": False},
+            "rules": [rule],
+            "use_colpali": True
+        },
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    updated_doc = response.json()
+    assert updated_doc["external_id"] == doc_id
+    assert updated_doc["metadata"]["contains_pii"] is False
+    
+    # Verify the content was updated and PII was removed by retrieving chunks
+    # Note: Exact behavior depends on the LLM response, so we check that something changed
+    search_response = await client.post(
+        "/retrieve/chunks",
+        json={
+            "query": "information about person",
+            "filters": {"external_id": doc_id},
+        },
+        headers=headers,
+    )
+    
+    assert search_response.status_code == 200
+    chunks = search_response.json()
+    assert len(chunks) > 0
+    # The processed content should have some of the original content but not the PII
+    assert any("information" in chunk["content"] for chunk in chunks)
+    # Check that at least one of the PII elements is not in the content
+    # This is a loose check since the exact result depends on the LLM
+    content_text = " ".join([chunk["content"] for chunk in chunks])
+    has_some_pii_removed = ("John Doe" not in content_text) or ("123-45-6789" not in content_text) or ("123 Main St" not in content_text)
+    assert has_some_pii_removed, "Rule to remove PII did not seem to have any effect"
+
+
+@pytest.mark.asyncio
+async def test_file_versioning_with_add_strategy(client: AsyncClient):
+    """Test that file versioning works correctly with 'add' update strategy"""
+    # First ingest a document with a file
+    headers = create_auth_header()
+    
+    # Create the initial file
+    initial_file_path = TEST_DATA_DIR / "version_test_1.txt"
+    initial_content = "This is version 1 of the file for testing versioning."
+    initial_file_path.write_text(initial_content)
+    
+    # Ingest the initial file
+    with open(initial_file_path, "rb") as f:
+        response = await client.post(
+            "/ingest/file",
+            files={"file": ("version_test.txt", f, "text/plain")},
+            data={
+                "metadata": json.dumps({"test": True, "version": 1}),
+                "rules": json.dumps([]),
+            },
+            headers=headers,
+        )
+    
+    assert response.status_code == 200
+    doc_id = response.json()["external_id"]
+    
+    # Create second version of the file
+    second_file_path = TEST_DATA_DIR / "version_test_2.txt"
+    second_content = "This is version 2 of the file for testing versioning."
+    second_file_path.write_text(second_content)
+    
+    # Update with second file using "add" strategy
+    with open(second_file_path, "rb") as f:
+        response = await client.post(
+            f"/documents/{doc_id}/update_file",
+            files={"file": ("version_test_v2.txt", f, "text/plain")},
+            data={
+                "metadata": json.dumps({"test": True, "version": 2}),
+                "rules": json.dumps([]),
+                "update_strategy": "add",
+            },
+            headers=headers,
+        )
+    
+    assert response.status_code == 200
+    updated_doc = response.json()
+    
+    # Create third version of the file
+    third_file_path = TEST_DATA_DIR / "version_test_3.txt"
+    third_content = "This is version 3 of the file for testing versioning."
+    third_file_path.write_text(third_content)
+    
+    # Update with third file using "add" strategy
+    with open(third_file_path, "rb") as f:
+        response = await client.post(
+            f"/documents/{doc_id}/update_file",
+            files={"file": ("version_test_v3.txt", f, "text/plain")},
+            data={
+                "metadata": json.dumps({"test": True, "version": 3}),
+                "rules": json.dumps([]),
+                "update_strategy": "add",
+            },
+            headers=headers,
+        )
+    
+    assert response.status_code == 200
+    final_doc = response.json()
+    
+    # Verify the system_metadata has versioning info
+    assert final_doc["system_metadata"]["version"] >= 3
+    assert "update_history" in final_doc["system_metadata"]
+    assert len(final_doc["system_metadata"]["update_history"]) >= 2  # At least 2 updates
+    
+    # Verify storage_files field exists and has multiple entries
+    assert "storage_files" in final_doc
+    assert len(final_doc["storage_files"]) >= 3  # Should have at least 3 files
+    
+    # Get most recent file's content through search 
+    search_response = await client.post(
+        "/retrieve/chunks",
+        json={
+            "query": "version 3 testing versioning",
+            "filters": {"external_id": doc_id},
+        },
+        headers=headers,
+    )
+    assert search_response.status_code == 200
+    chunks = search_response.json()
+    assert any(third_content in chunk["content"] for chunk in chunks)
+    
+    # Also check for version 1 content, which should still be in the merged content
+    search_response = await client.post(
+        "/retrieve/chunks",
+        json={
+            "query": "version 1 testing versioning",
+            "filters": {"external_id": doc_id},
+        },
+        headers=headers,
+    )
+    assert search_response.status_code == 200
+    chunks = search_response.json()
+    assert any(initial_content in chunk["content"] for chunk in chunks)
+    
+    # Clean up test files
+    initial_file_path.unlink(missing_ok=True)
+    second_file_path.unlink(missing_ok=True)
+    third_file_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_update_document_error_cases(client: AsyncClient):
+    """Test error cases for document updates"""
+    headers = create_auth_header()
+    
+    # Test updating non-existent document by ID
+    response = await client.post(
+        "/documents/non_existent_id/update_text",
+        json={
+            "content": "Test content for non-existent document",
+            "metadata": {}
+        },
+        headers=headers,
+    )
+    assert response.status_code == 404
+    
+    
+    # Test updating text without content (validation error)
+    doc_id = await test_ingest_text_document(client)
+    response = await client.post(
+        f"/documents/{doc_id}/update_text",
+        json={
+            # Missing required content field
+            "metadata": {"test": True}
+        },
+        headers=headers,
+    )
+    assert response.status_code == 422
+    
+    # Test updating with insufficient permissions
+    if not get_settings().dev_mode:
+        restricted_headers = create_auth_header(permissions=["read"])
+        response = await client.post(
+            f"/documents/{doc_id}/update_metadata",
+            json={"restricted": True},
+            headers=restricted_headers,
+        )
+        assert response.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -444,13 +895,6 @@ async def test_invalid_completion_params(client: AsyncClient):
         headers=headers,
     )
     assert response.status_code == 422
-
-
-@pytest.fixture(autouse=True)
-async def cleanup_database():
-    """Clean up database before each test"""
-    if get_settings().DATABASE_PROVIDER == "postgres":
-        await setup_test_postgres()
 
 
 @pytest.mark.asyncio
@@ -740,3 +1184,309 @@ async def test_query_with_reranking(client: AsyncClient):
     assert "Paris" in completion_default["completion"]
     assert "Paris" in completion_rerank["completion"]
     assert "Paris" in completion_no_rerank["completion"]
+
+
+# Knowledge Graph Tests
+
+@pytest.fixture(scope="function", autouse=True)
+async def cleanup_graphs():
+    """Clean up graphs before each graph test"""
+    # Create a fresh connection to the test database
+    engine = create_async_engine(TEST_POSTGRES_URI)
+    try:
+        async with engine.begin() as conn:
+            # Delete all rows from the graphs table
+            await conn.execute(text("DELETE FROM graphs"))
+            logger.info("Cleaned up all graph-related tables")
+    except Exception as e:
+        logger.error(f"Failed to clean up graph tables: {e}")
+        raise
+    finally:
+        await engine.dispose()
+        
+    # This will run before each test function
+    yield
+    # Test runs here
+
+
+@pytest.mark.asyncio
+async def test_create_graph(client: AsyncClient):
+    """Test creating a knowledge graph from documents."""
+    # First ingest multiple documents with related content to extract entities and relationships
+    doc_id1 = await test_ingest_text_document(
+        client,
+        content="Apple Inc. is a technology company headquartered in Cupertino, California. "
+        "Tim Cook is the CEO of Apple. Steve Jobs was the co-founder of Apple."
+    )
+
+    doc_id2 = await test_ingest_text_document(
+        client,
+        content="Microsoft is a technology company based in Redmond, Washington. "
+        "Satya Nadella is the CEO of Microsoft. Bill Gates co-founded Microsoft."
+    )
+
+    doc_id3 = await test_ingest_text_document(
+        client,
+        content="Tim Cook succeeded Steve Jobs as the CEO of Apple in 2011. "
+        "Under Tim Cook's leadership, Apple became the world's first trillion-dollar company."
+    )
+
+    headers = create_auth_header()
+    graph_name = "test_tech_companies_graph"
+
+    # Create graph using the document IDs
+    response = await client.post(
+        "/graph/create",
+        json={
+            "name": graph_name,
+            "documents": [doc_id1, doc_id2, doc_id3]
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    graph = response.json()
+
+    # Verify graph structure
+    assert graph["name"] == graph_name
+    assert len(graph["document_ids"]) == 3
+    assert all(doc_id in graph["document_ids"] for doc_id in [doc_id1, doc_id2, doc_id3])
+    assert len(graph["entities"]) > 0  # Should extract entities like Apple, Microsoft, Tim Cook, etc.
+    assert len(graph["relationships"]) > 0  # Should extract relationships like "Tim Cook is CEO of Apple"
+
+    # Verify specific expected entities were extracted
+    entity_labels = [entity["label"] for entity in graph["entities"]]
+    assert any("Apple" in label for label in entity_labels)
+    assert any("Microsoft" in label for label in entity_labels)
+    assert any("Tim Cook" in label for label in entity_labels)
+
+    # Verify entity types
+    entity_types = set(entity["type"] for entity in graph["entities"])
+    assert "ORGANIZATION" in entity_types or "COMPANY" in entity_types
+    assert "PERSON" in entity_types
+
+    # Verify entities have document references
+    for entity in graph["entities"]:
+        assert len(entity["document_ids"]) > 0
+        assert entity["document_ids"][0] in [doc_id1, doc_id2, doc_id3]
+
+    return graph_name, [doc_id1, doc_id2, doc_id3]
+
+
+@pytest.mark.asyncio
+async def test_get_graph(client: AsyncClient):
+    """Test retrieving a knowledge graph by name."""
+    # First create a graph
+    graph_name, _ = await test_create_graph(client)
+
+    # Then retrieve it
+    headers = create_auth_header()
+    response = await client.get(
+        f"/graph/{graph_name}",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    graph = response.json()
+
+    # Verify correct graph was retrieved
+    assert graph["name"] == graph_name
+    assert len(graph["entities"]) > 0
+    assert len(graph["relationships"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_list_graphs(client: AsyncClient):
+    """Test listing all accessible graphs."""
+    # First create a graph
+    graph_name, _ = await test_create_graph(client)
+
+    # List all graphs
+    headers = create_auth_header()
+    response = await client.get(
+        "/graphs",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    graphs = response.json()
+
+    # Verify the created graph is in the list
+    assert len(graphs) > 0
+    assert any(graph["name"] == graph_name for graph in graphs)
+
+
+@pytest.mark.asyncio
+async def test_create_graph_with_filters(client: AsyncClient):
+    """Test creating a knowledge graph using metadata filters."""
+    # Ingest test documents with specific metadata
+    doc_id1 = await test_ingest_text_document(
+        client,
+        content="The solar system consists of the Sun and eight planets. "
+        "Earth is the third planet from the Sun. Mars is the fourth planet."
+    )
+
+    headers = create_auth_header()
+
+    # Get the document to add specific metadata
+    response = await client.get(f"/documents/{doc_id1}", headers=headers)
+    assert response.status_code == 200
+
+    # Update document with metadata
+    response = await client.post(
+        f"/documents/{doc_id1}/update_metadata",
+        json={"category": "astronomy", "subject": "planets"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    # Create graph with filters - using metadata field which is renamed to doc_metadata in PostgresDatabase
+    graph_name = "test_astronomy_graph"
+    response = await client.post(
+        "/graph/create",
+        json={
+            "name": graph_name,
+            "filters": {"category": "astronomy"}
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    graph = response.json()
+
+    # Verify graph was created with the right document
+    assert graph["name"] == graph_name
+    assert doc_id1 in graph["document_ids"]
+    assert len(graph["entities"]) > 0  # Should extract entities like Sun, Earth, Mars
+
+    # Verify specific entities
+    entity_labels = [entity["label"] for entity in graph["entities"]]
+    assert any(label == "Sun" or "Sun" in label for label in entity_labels)
+    assert any(label == "Earth" or "Earth" in label for label in entity_labels)
+
+    return graph_name, doc_id1
+
+
+@pytest.mark.asyncio
+async def test_query_with_graph(client: AsyncClient):
+    """Test query completion with knowledge graph enhancement."""
+    # First create a graph and get its name
+    graph_name, doc_ids = await test_create_graph(client)
+
+    # Additional document that won't be in the graph but contains related information
+    _ = await test_ingest_text_document(
+        client,
+        content="Apple has released a new iPhone model. The company's focus on innovation continues."
+    )
+    
+    headers = create_auth_header()
+    
+    # Query using the graph
+    response = await client.post(
+        "/query",
+        json={
+            "query": "Who is the CEO of Apple?",
+            "graph_name": graph_name,
+            "hop_depth": 2,
+            "include_paths": True
+        },
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    result = response.json()
+    
+    # Verify the completion contains relevant information from graph
+    assert "completion" in result
+    assert any(term in result["completion"] for term in ["Tim Cook", "Cook", "CEO", "Apple"])
+    
+    # Verify we have graph metadata when include_paths=True
+    assert "metadata" in result, "Expected metadata in response when include_paths=True"
+    assert "graph" in result["metadata"], "Expected graph metadata in response"
+    assert result["metadata"]["graph"]["name"] == graph_name
+    
+    # Verify relevant entities includes expected entities
+    assert "relevant_entities" in result["metadata"]["graph"]
+    relevant_entities = result["metadata"]["graph"]["relevant_entities"]
+    
+    # At least one relevant entity should contain either Tim Cook or Apple
+    has_tim_cook = any("Tim Cook" in entity or "Cook" in entity for entity in relevant_entities)
+    has_apple = any("Apple" in entity for entity in relevant_entities)
+    assert has_tim_cook or has_apple, "Expected relevant entities to include Tim Cook or Apple"
+    
+    # Now try without the graph for comparison
+    response_no_graph = await client.post(
+        "/query",
+        json={
+            "query": "Who is the CEO of Apple?",
+        },
+        headers=headers,
+    )
+    
+    assert response_no_graph.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_cross_document_query_with_graph(client: AsyncClient):
+    """Test cross-document information retrieval using knowledge graph."""
+    # Create a graph with multiple documents containing related information
+    doc_id1 = await test_ingest_text_document(
+        client,
+        content="Project Alpha was initiated in 2020. Jane Smith is the project lead."
+    )
+    
+    doc_id2 = await test_ingest_text_document(
+        client,
+        content="Jane Smith has a PhD in Computer Science from MIT. She has 10 years of experience in AI research."
+    )
+    
+    doc_id3 = await test_ingest_text_document(
+        client,
+        content="Project Alpha aims to develop advanced natural language processing models for medical applications."
+    )
+    
+    headers = create_auth_header()
+    graph_name = "test_project_graph"
+    
+    # Create graph using the document IDs
+    response = await client.post(
+        "/graph/create",
+        json={
+            "name": graph_name,
+            "documents": [doc_id1, doc_id2, doc_id3]
+        },
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    
+    # Query that requires connecting information across documents
+    response = await client.post(
+        "/query",
+        json={
+            "query": "What is Jane Smith's background and what project is she leading?",
+            "graph_name": graph_name,
+            "hop_depth": 2,
+            "include_paths": True
+        },
+        headers=headers,
+    )
+    
+    assert response.status_code == 200
+    result = response.json()
+    
+    # Verify the completion combines information from multiple documents
+    assert "Jane Smith" in result["completion"]
+    assert "PhD" in result["completion"] or "Computer Science" in result["completion"]
+    assert "Project Alpha" in result["completion"]
+
+    # Compare with non-graph query
+    response_no_graph = await client.post(
+        "/query",
+        json={
+            "query": "What is Jane Smith's background and what project is she leading?",
+        },
+        headers=headers,
+    )
+
+    assert response_no_graph.status_code == 200

@@ -1,4 +1,7 @@
-from typing import Dict, Any, List, Literal, Optional
+from typing import Dict, Any, List, Literal, Optional, Union
+from io import BinaryIO
+from pathlib import Path
+from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -19,6 +22,102 @@ class Document(BaseModel):
         default_factory=dict, description="Access control information"
     )
     chunk_ids: List[str] = Field(default_factory=list, description="IDs of document chunks")
+    
+    # Client reference for update methods
+    _client = None
+    
+    def update_with_text(
+        self,
+        content: str,
+        filename: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        rules: Optional[List] = None,
+        update_strategy: str = "add",
+        use_colpali: Optional[bool] = None,
+    ) -> "Document":
+        """
+        Update this document with new text content using the specified strategy.
+        
+        Args:
+            content: The new content to add
+            filename: Optional new filename for the document
+            metadata: Additional metadata to update (optional)
+            rules: Optional list of rules to apply to the content
+            update_strategy: Strategy for updating the document (currently only 'add' is supported)
+            use_colpali: Whether to use multi-vector embedding
+            
+        Returns:
+            Document: Updated document metadata
+        """
+        if self._client is None:
+            raise ValueError("Document instance not connected to a client. Use a document returned from a DataBridge client method.")
+            
+        return self._client.update_document_with_text(
+            document_id=self.external_id,
+            content=content,
+            filename=filename,
+            metadata=metadata,
+            rules=rules,
+            update_strategy=update_strategy,
+            use_colpali=use_colpali
+        )
+        
+    def update_with_file(
+        self,
+        file: "Union[str, bytes, BinaryIO, Path]",
+        filename: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        rules: Optional[List] = None,
+        update_strategy: str = "add",
+        use_colpali: Optional[bool] = None,
+    ) -> "Document":
+        """
+        Update this document with content from a file using the specified strategy.
+        
+        Args:
+            file: File to add (path string, bytes, file object, or Path)
+            filename: Name of the file
+            metadata: Additional metadata to update (optional)
+            rules: Optional list of rules to apply to the content
+            update_strategy: Strategy for updating the document (currently only 'add' is supported)
+            use_colpali: Whether to use multi-vector embedding
+            
+        Returns:
+            Document: Updated document metadata
+        """
+        if self._client is None:
+            raise ValueError("Document instance not connected to a client. Use a document returned from a DataBridge client method.")
+            
+        return self._client.update_document_with_file(
+            document_id=self.external_id,
+            file=file,
+            filename=filename,
+            metadata=metadata,
+            rules=rules,
+            update_strategy=update_strategy,
+            use_colpali=use_colpali
+        )
+        
+    def update_metadata(
+        self,
+        metadata: Dict[str, Any],
+    ) -> "Document":
+        """
+        Update this document's metadata only.
+        
+        Args:
+            metadata: Metadata to update
+            
+        Returns:
+            Document: Updated document metadata
+        """
+        if self._client is None:
+            raise ValueError("Document instance not connected to a client. Use a document returned from a DataBridge client method.")
+            
+        return self._client.update_document_metadata(
+            document_id=self.external_id,
+            metadata=metadata
+        )
 
 
 class ChunkResult(BaseModel):
@@ -75,6 +174,7 @@ class CompletionResponse(BaseModel):
     sources: List[ChunkSource] = Field(
         default_factory=list, description="Sources of chunks used in the completion"
     )
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class IngestTextRequest(BaseModel):
@@ -85,3 +185,59 @@ class IngestTextRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     rules: List[Dict[str, Any]] = Field(default_factory=list)
     use_colpali: bool = Field(default=False)
+
+
+class Entity(BaseModel):
+    """Represents an entity in a knowledge graph"""
+
+    id: str = Field(..., description="Unique entity identifier")
+    label: str = Field(..., description="Display label for the entity")
+    type: str = Field(..., description="Entity type")
+    properties: Dict[str, Any] = Field(default_factory=dict, description="Entity properties")
+    document_ids: List[str] = Field(default_factory=list, description="Source document IDs")
+    chunk_sources: Dict[str, List[int]] = Field(default_factory=dict, description="Source chunk numbers by document ID")
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if not isinstance(other, Entity):
+            return False
+        return self.id == other.id
+
+
+class Relationship(BaseModel):
+    """Represents a relationship between entities in a knowledge graph"""
+
+    id: str = Field(..., description="Unique relationship identifier")
+    source_id: str = Field(..., description="Source entity ID")
+    target_id: str = Field(..., description="Target entity ID")
+    type: str = Field(..., description="Relationship type")
+    document_ids: List[str] = Field(default_factory=list, description="Source document IDs")
+    chunk_sources: Dict[str, List[int]] = Field(default_factory=dict, description="Source chunk numbers by document ID")
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if not isinstance(other, Relationship):
+            return False
+        return self.id == other.id
+
+
+class Graph(BaseModel):
+    """Represents a knowledge graph"""
+
+    id: str = Field(..., description="Unique graph identifier")
+    name: str = Field(..., description="Graph name")
+    entities: List[Entity] = Field(default_factory=list, description="Entities in the graph")
+    relationships: List[Relationship] = Field(default_factory=list, description="Relationships in the graph")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Graph metadata")
+    document_ids: List[str] = Field(default_factory=list, description="Source document IDs")
+    filters: Optional[Dict[str, Any]] = Field(None, description="Document filters used to create the graph")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    owner: Dict[str, str] = Field(default_factory=dict, description="Graph owner information")
+    access_control: Dict[str, List[str]] = Field(
+        default_factory=dict, description="Access control information"
+    )

@@ -3,6 +3,7 @@ from typing import List, Optional, Dict, Any
 
 from ..models.documents import Document
 from ..models.auth import AuthContext
+from ..models.graph import Graph
 
 
 class BaseDatabase(ABC):
@@ -21,6 +22,21 @@ class BaseDatabase(ABC):
         """
         Retrieve document metadata by ID if user has access.
         Returns: Document if found and accessible, None otherwise
+        """
+        pass
+        
+    @abstractmethod
+    async def get_document_by_filename(self, filename: str, auth: AuthContext) -> Optional[Document]:
+        """
+        Retrieve document metadata by filename if user has access.
+        If multiple documents have the same filename, returns the most recently updated one.
+        
+        Args:
+            filename: The filename to search for
+            auth: Authentication context
+            
+        Returns:
+            Document if found and accessible, None otherwise
         """
         pass
         
@@ -110,5 +126,42 @@ class BaseDatabase(ABC):
 
         Returns:
             Optional[Dict[str, Any]]: Cache metadata if found, None otherwise
+        """
+        pass
+
+    @abstractmethod
+    async def store_graph(self, graph: Graph) -> bool:
+        """Store a graph.
+
+        Args:
+            graph: Graph to store
+
+        Returns:
+            bool: Whether the operation was successful
+        """
+        pass
+
+    @abstractmethod
+    async def get_graph(self, name: str, auth: AuthContext) -> Optional[Graph]:
+        """Get a graph by name.
+
+        Args:
+            name: Name of the graph
+            auth: Authentication context
+
+        Returns:
+            Optional[Graph]: Graph if found and accessible, None otherwise
+        """
+        pass
+
+    @abstractmethod
+    async def list_graphs(self, auth: AuthContext) -> List[Graph]:
+        """List all graphs the user has access to.
+
+        Args:
+            auth: Authentication context
+
+        Returns:
+            List[Graph]: List of graphs
         """
         pass

@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from .base_database import BaseDatabase
 from ..models.documents import Document
 from ..models.auth import AuthContext
+from ..models.graph import Graph, Entity, Relationship
 
 logger = logging.getLogger(__name__)
 Base = declarative_base()
@@ -30,12 +31,38 @@ class DocumentModel(Base):
     additional_metadata = Column(JSONB, default=dict)
     access_control = Column(JSONB, default=dict)
     chunk_ids = Column(JSONB, default=list)
+    storage_files = Column(JSONB, default=list)
 
     # Create indexes
     __table_args__ = (
         Index("idx_owner_id", "owner", postgresql_using="gin"),
         Index("idx_access_control", "access_control", postgresql_using="gin"),
         Index("idx_system_metadata", "system_metadata", postgresql_using="gin"),
+    )
+
+
+class GraphModel(Base):
+    """SQLAlchemy model for graph data."""
+
+    __tablename__ = "graphs"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, unique=True, index=True)
+    entities = Column(JSONB, default=list)
+    relationships = Column(JSONB, default=list)
+    graph_metadata = Column(JSONB, default=dict)  # Renamed from 'metadata' to avoid conflict
+    document_ids = Column(JSONB, default=list)
+    filters = Column(JSONB, nullable=True)
+    created_at = Column(String)  # ISO format string
+    updated_at = Column(String)  # ISO format string
+    owner = Column(JSONB)
+    access_control = Column(JSONB, default=dict)
+
+    # Create indexes
+    __table_args__ = (
+        Index("idx_graph_name", "name"),
+        Index("idx_graph_owner", "owner", postgresql_using="gin"),
+        Index("idx_graph_access_control", "access_control", postgresql_using="gin"),
     )
 
 
@@ -60,14 +87,24 @@ class PostgresDatabase(BaseDatabase):
         """Initialize PostgreSQL connection for document storage."""
         self.engine = create_async_engine(uri)
         self.async_session = sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+        self._initialized = False
 
     async def initialize(self):
         """Initialize database tables and indexes."""
-        try:
-            async with self.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+        if self._initialized:
+            return True
 
-                # Create caches table if it doesn't exist
+        try:
+            logger.info("Initializing PostgreSQL database tables and indexes...")
+            # Create ORM models
+            async with self.engine.begin() as conn:
+                # Explicitly create all tables with checkfirst=True to avoid errors if tables already exist
+                await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+
+                # No need to manually create graphs table again since SQLAlchemy does it
+                logger.info("Created database tables successfully")
+
+                # Create caches table if it doesn't exist (kept as direct SQL for backward compatibility)
                 await conn.execute(
                     text(
                         """
@@ -81,7 +118,30 @@ class PostgresDatabase(BaseDatabase):
                     )
                 )
 
+                # Check if storage_files column exists
+                result = await conn.execute(
+                    text(
+                        """
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'documents' AND column_name = 'storage_files'
+                    """
+                    )
+                )
+                if not result.first():
+                    # Add storage_files column to documents table
+                    await conn.execute(
+                        text(
+                            """
+                        ALTER TABLE documents 
+                        ADD COLUMN IF NOT EXISTS storage_files JSONB DEFAULT '[]'::jsonb
+                        """
+                        )
+                    )
+                    logger.info("Added storage_files column to documents table")
+
             logger.info("PostgreSQL tables and indexes created successfully")
+            self._initialized = True
             return True
 
         except Exception as e:
@@ -97,11 +157,17 @@ class PostgresDatabase(BaseDatabase):
             if "metadata" in doc_dict:
                 doc_dict["doc_metadata"] = doc_dict.pop("metadata")
             doc_dict["doc_metadata"]["external_id"] = doc_dict["external_id"]
+
             # Ensure system metadata
             if "system_metadata" not in doc_dict:
                 doc_dict["system_metadata"] = {}
             doc_dict["system_metadata"]["created_at"] = datetime.now(UTC)
             doc_dict["system_metadata"]["updated_at"] = datetime.now(UTC)
+
+            # Handle storage_files
+            if "storage_files" in doc_dict and doc_dict["storage_files"]:
+                # Convert storage_files to the expected format for storage
+                doc_dict["storage_files"] = [file.model_dump() for file in doc_dict["storage_files"]]
 
             # Serialize datetime objects to ISO format strings
             doc_dict = _serialize_datetime(doc_dict)
@@ -146,12 +212,56 @@ class PostgresDatabase(BaseDatabase):
                         "additional_metadata": doc_model.additional_metadata,
                         "access_control": doc_model.access_control,
                         "chunk_ids": doc_model.chunk_ids,
+                        "storage_files": doc_model.storage_files or [],
                     }
                     return Document(**doc_dict)
                 return None
                 
         except Exception as e:
             logger.error(f"Error retrieving document metadata: {str(e)}")
+            return None
+            
+    async def get_document_by_filename(self, filename: str, auth: AuthContext) -> Optional[Document]:
+        """Retrieve document metadata by filename if user has access.
+        If multiple documents have the same filename, returns the most recently updated one.
+        """
+        try:
+            async with self.async_session() as session:
+                # Build access filter
+                access_filter = self._build_access_filter(auth)
+
+                # Query document
+                query = (
+                    select(DocumentModel)
+                    .where(DocumentModel.filename == filename)
+                    .where(text(f"({access_filter})"))
+                    # Order by updated_at in system_metadata to get the most recent document
+                    .order_by(text("system_metadata->>'updated_at' DESC"))
+                )
+
+                result = await session.execute(query)
+                doc_model = result.scalar_one_or_none()
+
+                if doc_model:
+                    # Convert doc_metadata back to metadata
+                    doc_dict = {
+                        "external_id": doc_model.external_id,
+                        "owner": doc_model.owner,
+                        "content_type": doc_model.content_type,
+                        "filename": doc_model.filename,
+                        "metadata": doc_model.doc_metadata,
+                        "storage_info": doc_model.storage_info,
+                        "system_metadata": doc_model.system_metadata,
+                        "additional_metadata": doc_model.additional_metadata,
+                        "access_control": doc_model.access_control,
+                        "chunk_ids": doc_model.chunk_ids,
+                        "storage_files": doc_model.storage_files or [],
+                    }
+                    return Document(**doc_dict)
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error retrieving document metadata by filename: {str(e)}")
             return None
             
     async def get_documents_by_id(self, document_ids: List[str], auth: AuthContext) -> List[Document]:
@@ -201,6 +311,7 @@ class PostgresDatabase(BaseDatabase):
                         "additional_metadata": doc_model.additional_metadata,
                         "access_control": doc_model.access_control,
                         "chunk_ids": doc_model.chunk_ids,
+                        "storage_files": doc_model.storage_files or [],
                     }
                     documents.append(Document(**doc_dict))
                 
@@ -246,6 +357,7 @@ class PostgresDatabase(BaseDatabase):
                         additional_metadata=doc.additional_metadata,
                         access_control=doc.access_control,
                         chunk_ids=doc.chunk_ids,
+                        storage_files=doc.storage_files or [],
                     )
                     for doc in doc_models
                 ]
@@ -395,6 +507,12 @@ class PostgresDatabase(BaseDatabase):
             # Convert boolean values to string 'true' or 'false'
             if isinstance(value, bool):
                 value = str(value).lower()
+                
+            # Use proper SQL escaping for string values
+            if isinstance(value, str):
+                # Replace single quotes with double single quotes to escape them
+                value = value.replace("'", "''") 
+                
             filter_conditions.append(f"doc_metadata->>'{key}' = '{value}'")
 
         return " AND ".join(filter_conditions)
@@ -449,3 +567,141 @@ class PostgresDatabase(BaseDatabase):
         except Exception as e:
             logger.error(f"Failed to get cache metadata: {e}")
             return None
+
+    async def store_graph(self, graph: Graph) -> bool:
+        """Store a graph in PostgreSQL.
+
+        This method stores the graph metadata, entities, and relationships
+        in a PostgreSQL table.
+
+        Args:
+            graph: Graph to store
+
+        Returns:
+            bool: Whether the operation was successful
+        """
+        # Ensure database is initialized
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            # First serialize the graph model to dict
+            graph_dict = graph.model_dump()
+
+            # Change 'metadata' to 'graph_metadata' to match our model
+            if "metadata" in graph_dict:
+                graph_dict["graph_metadata"] = graph_dict.pop("metadata")
+
+            # Serialize datetime objects to ISO format strings
+            graph_dict = _serialize_datetime(graph_dict)
+
+            # Store the graph metadata in PostgreSQL
+            async with self.async_session() as session:
+                # Store graph metadata in our table
+                graph_model = GraphModel(**graph_dict)
+                session.add(graph_model)
+                await session.commit()
+                logger.info(f"Stored graph '{graph.name}' with {len(graph.entities)} entities and {len(graph.relationships)} relationships")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error storing graph: {str(e)}")
+            return False
+
+    async def get_graph(self, name: str, auth: AuthContext) -> Optional[Graph]:
+        """Get a graph by name.
+
+        Args:
+            name: Name of the graph
+            auth: Authentication context
+
+        Returns:
+            Optional[Graph]: Graph if found and accessible, None otherwise
+        """
+        # Ensure database is initialized
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            async with self.async_session() as session:
+                # Build access filter
+                access_filter = self._build_access_filter(auth)
+
+                # Query graph
+                query = (
+                    select(GraphModel)
+                    .where(GraphModel.name == name)
+                    .where(text(f"({access_filter})"))
+                )
+
+                result = await session.execute(query)
+                graph_model = result.scalar_one_or_none()
+
+                if graph_model:
+                    # Convert to Graph model
+                    graph_dict = {
+                        "id": graph_model.id,
+                        "name": graph_model.name,
+                        "entities": graph_model.entities,
+                        "relationships": graph_model.relationships,
+                        "metadata": graph_model.graph_metadata,  # Reference the renamed column
+                        "document_ids": graph_model.document_ids,
+                        "filters": graph_model.filters,
+                        "created_at": graph_model.created_at,
+                        "updated_at": graph_model.updated_at,
+                        "owner": graph_model.owner,
+                        "access_control": graph_model.access_control,
+                    }
+                    return Graph(**graph_dict)
+
+                return None
+
+        except Exception as e:
+            logger.error(f"Error retrieving graph: {str(e)}")
+            return None
+
+    async def list_graphs(self, auth: AuthContext) -> List[Graph]:
+        """List all graphs the user has access to.
+
+        Args:
+            auth: Authentication context
+
+        Returns:
+            List[Graph]: List of graphs
+        """
+        # Ensure database is initialized
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            async with self.async_session() as session:
+                # Build access filter
+                access_filter = self._build_access_filter(auth)
+
+                # Query graphs
+                query = select(GraphModel).where(text(f"({access_filter})"))
+
+                result = await session.execute(query)
+                graph_models = result.scalars().all()
+
+                return [
+                    Graph(
+                        id=graph.id,
+                        name=graph.name,
+                        entities=graph.entities,
+                        relationships=graph.relationships,
+                        metadata=graph.graph_metadata,  # Reference the renamed column
+                        document_ids=graph.document_ids,
+                        filters=graph.filters,
+                        created_at=graph.created_at,
+                        updated_at=graph.updated_at,
+                        owner=graph.owner,
+                        access_control=graph.access_control,
+                    )
+                    for graph in graph_models
+                ]
+
+        except Exception as e:
+            logger.error(f"Error listing graphs: {str(e)}")
+            return []

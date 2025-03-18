@@ -12,7 +12,15 @@ import jwt
 from pydantic import BaseModel, Field
 import requests
 
-from .models import Document, ChunkResult, DocumentResult, CompletionResponse, IngestTextRequest, ChunkSource
+from .models import (
+    Document, 
+    ChunkResult, 
+    DocumentResult, 
+    CompletionResponse, 
+    IngestTextRequest, 
+    ChunkSource,
+    Graph
+)
 from .rules import Rule
 
 # Type alias for rules
@@ -198,7 +206,9 @@ class DataBridge:
             use_colpali=use_colpali,
         )
         response = self._request("POST", "ingest/text", data=request.model_dump())
-        return Document(**response)
+        doc = Document(**response)
+        doc._client = self
+        return doc
 
     def ingest_file(
         self,
@@ -274,9 +284,11 @@ class DataBridge:
             }
 
             response = self._request(
-                "POST", f"ingest/file?use_colpali={use_colpali}", data=form_data, files=files
+                "POST", f"ingest/file?use_colpali={str(use_colpali).lower()}", data=form_data, files=files
             )
-            return Document(**response)
+            doc = Document(**response)
+            doc._client = self
+            return doc
         finally:
             # Close file if we opened it
             if isinstance(file, (str, Path)):
@@ -315,7 +327,7 @@ class DataBridge:
             "filters": filters,
             "k": k,
             "min_score": min_score,
-            "use_colpali": json.dumps(use_colpali),
+            "use_colpali": use_colpali,
         }
 
         response = self._request("POST", "retrieve/chunks", request)
@@ -390,7 +402,7 @@ class DataBridge:
             "filters": filters,
             "k": k,
             "min_score": min_score,
-            "use_colpali": json.dumps(use_colpali),
+            "use_colpali": use_colpali,
         }
 
         response = self._request("POST", "retrieve/docs", request)
@@ -405,6 +417,9 @@ class DataBridge:
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         use_colpali: bool = True,
+        graph_name: Optional[str] = None,
+        hop_depth: int = 1,
+        include_paths: bool = False,
     ) -> CompletionResponse:
         """
         Generate completion using relevant chunks as context.
@@ -417,17 +432,35 @@ class DataBridge:
             max_tokens: Maximum tokens in completion
             temperature: Model temperature
             use_colpali: Whether to use ColPali-style embedding model to generate the completion (only works for documents ingested with `use_colpali=True`)
+            graph_name: Optional name of the graph to use for knowledge graph-enhanced retrieval
+            hop_depth: Number of relationship hops to traverse in the graph (1-3)
+            include_paths: Whether to include relationship paths in the response
         Returns:
             CompletionResponse
 
         Example:
             ```python
+            # Standard query
             response = db.query(
                 "What are the key findings about customer satisfaction?",
                 filters={"department": "research"},
                 temperature=0.7
             )
+            
+            # Knowledge graph enhanced query
+            response = db.query(
+                "How does product X relate to customer segment Y?",
+                graph_name="market_graph",
+                hop_depth=2,
+                include_paths=True
+            )
+            
             print(response.completion)
+            
+            # If include_paths=True, you can inspect the graph paths
+            if response.metadata and "graph" in response.metadata:
+                for path in response.metadata["graph"]["paths"]:
+                    print(" -> ".join(path))
             ```
         """
         request = {
@@ -437,7 +470,10 @@ class DataBridge:
             "min_score": min_score,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "use_colpali": json.dumps(use_colpali),
+            "use_colpali": use_colpali,
+            "graph_name": graph_name,
+            "hop_depth": hop_depth,
+            "include_paths": include_paths,
         }
 
         response = self._request("POST", "query", request)
@@ -467,7 +503,10 @@ class DataBridge:
             ```
         """
         response = self._request("GET", f"documents?skip={skip}&limit={limit}&filters={filters}")
-        return [Document(**doc) for doc in response]
+        docs = [Document(**doc) for doc in response]
+        for doc in docs:
+            doc._client = self
+        return docs
 
     def get_document(self, document_id: str) -> Document:
         """
@@ -486,7 +525,367 @@ class DataBridge:
             ```
         """
         response = self._request("GET", f"documents/{document_id}")
-        return Document(**response)
+        doc = Document(**response)
+        doc._client = self
+        return doc
+        
+    def get_document_by_filename(self, filename: str) -> Document:
+        """
+        Get document metadata by filename.
+        If multiple documents have the same filename, returns the most recently updated one.
+
+        Args:
+            filename: Filename of the document to retrieve
+
+        Returns:
+            Document: Document metadata
+
+        Example:
+            ```python
+            doc = db.get_document_by_filename("report.pdf")
+            print(f"Document ID: {doc.external_id}")
+            ```
+        """
+        response = self._request("GET", f"documents/filename/{filename}")
+        doc = Document(**response)
+        doc._client = self
+        return doc
+        
+    def update_document_with_text(
+        self,
+        document_id: str,
+        content: str,
+        filename: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        rules: Optional[List] = None,
+        update_strategy: str = "add",
+        use_colpali: Optional[bool] = None,
+    ) -> Document:
+        """
+        Update a document with new text content using the specified strategy.
+
+        Args:
+            document_id: ID of the document to update
+            content: The new content to add
+            filename: Optional new filename for the document
+            metadata: Additional metadata to update (optional)
+            rules: Optional list of rules to apply to the content
+            update_strategy: Strategy for updating the document (currently only 'add' is supported)
+            use_colpali: Whether to use multi-vector embedding
+
+        Returns:
+            Document: Updated document metadata
+
+        Example:
+            ```python
+            # Add new content to an existing document
+            updated_doc = db.update_document_with_text(
+                document_id="doc_123",
+                content="This is additional content that will be appended to the document.",
+                filename="updated_document.txt",
+                metadata={"category": "updated"},
+                update_strategy="add"
+            )
+            print(f"Document version: {updated_doc.system_metadata.get('version')}")
+            ```
+        """
+        # Use the dedicated text update endpoint
+        request = IngestTextRequest(
+            content=content,
+            filename=filename,
+            metadata=metadata or {},
+            rules=[self._convert_rule(r) for r in (rules or [])],
+            use_colpali=use_colpali if use_colpali is not None else True,
+        )
+        
+        params = {}
+        if update_strategy != "add":
+            params["update_strategy"] = update_strategy
+            
+        response = self._request(
+            "POST", 
+            f"documents/{document_id}/update_text", 
+            data=request.model_dump(),
+            params=params
+        )
+        
+        doc = Document(**response)
+        doc._client = self
+        return doc
+
+    def update_document_with_file(
+        self,
+        document_id: str,
+        file: Union[str, bytes, BinaryIO, Path],
+        filename: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        rules: Optional[List] = None,
+        update_strategy: str = "add",
+        use_colpali: Optional[bool] = None,
+    ) -> Document:
+        """
+        Update a document with content from a file using the specified strategy.
+
+        Args:
+            document_id: ID of the document to update
+            file: File to add (path string, bytes, file object, or Path)
+            filename: Name of the file
+            metadata: Additional metadata to update (optional)
+            rules: Optional list of rules to apply to the content
+            update_strategy: Strategy for updating the document (currently only 'add' is supported)
+            use_colpali: Whether to use multi-vector embedding
+
+        Returns:
+            Document: Updated document metadata
+
+        Example:
+            ```python
+            # Add content from a file to an existing document
+            updated_doc = db.update_document_with_file(
+                document_id="doc_123",
+                file="path/to/update.pdf",
+                metadata={"status": "updated"},
+                update_strategy="add"
+            )
+            print(f"Document version: {updated_doc.system_metadata.get('version')}")
+            ```
+        """
+        # Handle different file input types
+        if isinstance(file, (str, Path)):
+            file_path = Path(file)
+            if not file_path.exists():
+                raise ValueError(f"File not found: {file}")
+            filename = file_path.name if filename is None else filename
+            with open(file_path, "rb") as f:
+                content = f.read()
+                file_obj = BytesIO(content)
+        elif isinstance(file, bytes):
+            if filename is None:
+                raise ValueError("filename is required when updating with bytes")
+            file_obj = BytesIO(file)
+        else:
+            if filename is None:
+                raise ValueError("filename is required when updating with file object")
+            file_obj = file
+            
+        try:
+            # Prepare multipart form data
+            files = {"file": (filename, file_obj)}
+            
+            # Convert metadata and rules to JSON strings
+            form_data = {
+                "metadata": json.dumps(metadata or {}),
+                "rules": json.dumps([self._convert_rule(r) for r in (rules or [])]),
+                "update_strategy": update_strategy,
+            }
+            
+            if use_colpali is not None:
+                form_data["use_colpali"] = str(use_colpali).lower()
+                
+            # Use the dedicated file update endpoint
+            response = self._request(
+                "POST", f"documents/{document_id}/update_file", data=form_data, files=files
+            )
+            
+            doc = Document(**response)
+            doc._client = self
+            return doc
+        finally:
+            # Close file if we opened it
+            if isinstance(file, (str, Path)):
+                file_obj.close()
+    
+    def update_document_metadata(
+        self,
+        document_id: str,
+        metadata: Dict[str, Any],
+    ) -> Document:
+        """
+        Update a document's metadata only.
+        
+        Args:
+            document_id: ID of the document to update
+            metadata: Metadata to update
+            
+        Returns:
+            Document: Updated document metadata
+            
+        Example:
+            ```python
+            # Update just the metadata of a document
+            updated_doc = db.update_document_metadata(
+                document_id="doc_123",
+                metadata={"status": "reviewed", "reviewer": "Jane Smith"}
+            )
+            print(f"Updated metadata: {updated_doc.metadata}")
+            ```
+        """
+        # Use the dedicated metadata update endpoint
+        response = self._request("POST", f"documents/{document_id}/update_metadata", data=metadata)
+        doc = Document(**response)
+        doc._client = self
+        return doc
+        
+    def update_document_by_filename_with_text(
+        self,
+        filename: str,
+        content: str,
+        new_filename: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        rules: Optional[List] = None,
+        update_strategy: str = "add",
+        use_colpali: Optional[bool] = None,
+    ) -> Document:
+        """
+        Update a document identified by filename with new text content using the specified strategy.
+
+        Args:
+            filename: Filename of the document to update
+            content: The new content to add
+            new_filename: Optional new filename for the document
+            metadata: Additional metadata to update (optional)
+            rules: Optional list of rules to apply to the content
+            update_strategy: Strategy for updating the document (currently only 'add' is supported)
+            use_colpali: Whether to use multi-vector embedding
+
+        Returns:
+            Document: Updated document metadata
+
+        Example:
+            ```python
+            # Add new content to an existing document identified by filename
+            updated_doc = db.update_document_by_filename_with_text(
+                filename="report.pdf",
+                content="This is additional content that will be appended to the document.",
+                new_filename="updated_report.pdf",
+                metadata={"category": "updated"},
+                update_strategy="add"
+            )
+            print(f"Document version: {updated_doc.system_metadata.get('version')}")
+            ```
+        """
+        # First get the document by filename to obtain its ID
+        doc = self.get_document_by_filename(filename)
+        
+        # Then use the regular update_document_with_text endpoint with the document ID
+        return self.update_document_with_text(
+            document_id=doc.external_id,
+            content=content,
+            filename=new_filename,
+            metadata=metadata,
+            rules=rules,
+            update_strategy=update_strategy,
+            use_colpali=use_colpali
+        )
+        
+    def update_document_by_filename_with_file(
+        self,
+        filename: str,
+        file: Union[str, bytes, BinaryIO, Path],
+        new_filename: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        rules: Optional[List] = None,
+        update_strategy: str = "add",
+        use_colpali: Optional[bool] = None,
+    ) -> Document:
+        """
+        Update a document identified by filename with content from a file using the specified strategy.
+
+        Args:
+            filename: Filename of the document to update
+            file: File to add (path string, bytes, file object, or Path)
+            new_filename: Optional new filename for the document (defaults to the filename of the file)
+            metadata: Additional metadata to update (optional)
+            rules: Optional list of rules to apply to the content
+            update_strategy: Strategy for updating the document (currently only 'add' is supported)
+            use_colpali: Whether to use multi-vector embedding
+
+        Returns:
+            Document: Updated document metadata
+
+        Example:
+            ```python
+            # Add content from a file to an existing document identified by filename
+            updated_doc = db.update_document_by_filename_with_file(
+                filename="report.pdf",
+                file="path/to/update.pdf",
+                metadata={"status": "updated"},
+                update_strategy="add"
+            )
+            print(f"Document version: {updated_doc.system_metadata.get('version')}")
+            ```
+        """
+        # First get the document by filename to obtain its ID
+        doc = self.get_document_by_filename(filename)
+        
+        # Then use the regular update_document_with_file endpoint with the document ID
+        return self.update_document_with_file(
+            document_id=doc.external_id,
+            file=file,
+            filename=new_filename,
+            metadata=metadata,
+            rules=rules,
+            update_strategy=update_strategy,
+            use_colpali=use_colpali
+        )
+                
+    def update_document_by_filename_metadata(
+        self,
+        filename: str,
+        metadata: Dict[str, Any],
+        new_filename: Optional[str] = None,
+    ) -> Document:
+        """
+        Update a document's metadata using filename to identify the document.
+        
+        Args:
+            filename: Filename of the document to update
+            metadata: Metadata to update
+            new_filename: Optional new filename to assign to the document
+            
+        Returns:
+            Document: Updated document metadata
+            
+        Example:
+            ```python
+            # Update just the metadata of a document identified by filename
+            updated_doc = db.update_document_by_filename_metadata(
+                filename="report.pdf",
+                metadata={"status": "reviewed", "reviewer": "Jane Smith"},
+                new_filename="reviewed_report.pdf"  # Optional: rename the file
+            )
+            print(f"Updated metadata: {updated_doc.metadata}")
+            ```
+        """
+        # First get the document by filename to obtain its ID
+        doc = self.get_document_by_filename(filename)
+        
+        # Update the metadata
+        result = self.update_document_metadata(
+            document_id=doc.external_id,
+            metadata=metadata,
+        )
+        
+        # If new_filename is provided, update the filename as well
+        if new_filename:
+            # Create a request that retains the just-updated metadata but also changes filename
+            combined_metadata = result.metadata.copy()
+            
+            # Update the document again with filename change and the same metadata
+            response = self._request(
+                "POST", 
+                f"documents/{doc.external_id}/update_text", 
+                data={
+                    "content": "", 
+                    "filename": new_filename,
+                    "metadata": combined_metadata,
+                    "rules": []
+                }
+            )
+            result = Document(**response)
+            result._client = self
+            
+        return result
         
     def batch_get_documents(self, document_ids: List[str]) -> List[Document]:
         """
@@ -506,7 +905,10 @@ class DataBridge:
             ```
         """
         response = self._request("POST", "batch/documents", data=document_ids)
-        return [Document(**doc) for doc in response]
+        docs = [Document(**doc) for doc in response]
+        for doc in docs:
+            doc._client = self
+        return docs
         
     def batch_get_chunks(self, sources: List[Union[ChunkSource, Dict[str, Any]]]) -> List[FinalChunkResult]:
         """
@@ -647,6 +1049,88 @@ class DataBridge:
         if response.get("exists", False):
             return Cache(self, name)
         raise ValueError(f"Cache '{name}' not found")
+
+    def create_graph(
+        self,
+        name: str,
+        filters: Optional[Dict[str, Any]] = None,
+        documents: Optional[List[str]] = None,
+    ) -> Graph:
+        """
+        Create a graph from documents.
+
+        This method extracts entities and relationships from documents
+        matching the specified filters or document IDs and creates a graph.
+
+        Args:
+            name: Name of the graph to create
+            filters: Optional metadata filters to determine which documents to include
+            documents: Optional list of specific document IDs to include
+
+        Returns:
+            Graph: The created graph object
+
+        Example:
+            ```python
+            # Create a graph from documents with category="research"
+            graph = db.create_graph(
+                name="research_graph",
+                filters={"category": "research"}
+            )
+
+            # Create a graph from specific documents
+            graph = db.create_graph(
+                name="custom_graph",
+                documents=["doc1", "doc2", "doc3"]
+            )
+            ```
+        """
+        request = {
+            "name": name,
+            "filters": filters,
+            "documents": documents,
+        }
+
+        response = self._request("POST", "graph/create", request)
+        return Graph(**response)
+        
+    def get_graph(self, name: str) -> Graph:
+        """
+        Get a graph by name.
+
+        Args:
+            name: Name of the graph to retrieve
+
+        Returns:
+            Graph: The requested graph object
+
+        Example:
+            ```python
+            # Get a graph by name
+            graph = db.get_graph("finance_graph")
+            print(f"Graph has {len(graph.entities)} entities and {len(graph.relationships)} relationships")
+            ```
+        """
+        response = self._request("GET", f"graph/{name}")
+        return Graph(**response)
+
+    def list_graphs(self) -> List[Graph]:
+        """
+        List all graphs the user has access to.
+
+        Returns:
+            List[Graph]: List of graph objects
+
+        Example:
+            ```python
+            # List all accessible graphs
+            graphs = db.list_graphs()
+            for graph in graphs:
+                print(f"Graph: {graph.name}, Entities: {len(graph.entities)}")
+            ```
+        """
+        response = self._request("GET", "graphs")
+        return [Graph(**graph) for graph in response]
 
     def close(self):
         """Close the HTTP session"""

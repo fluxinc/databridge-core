@@ -1,4 +1,4 @@
-FROM postgres:15-alpine
+FROM postgres:17.4-alpine
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -6,20 +6,35 @@ RUN apk add --no-cache \
     build-base \
     clang \
     llvm \
-    postgresql-dev
+    postgresql17-dev
 
 # Clone and build pgvector
-RUN git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git \
+RUN git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git \
     && cd pgvector \
     && make OPTFLAGS="" \
     && make install
 
 # Cleanup
-RUN apk del git build-base clang llvm postgresql-dev \
-    && rm -rf /pgvector
+RUN apk del git build-base clang llvm postgresql17-dev \
+    && rm -rf /pgvector 
 
-# Copy initialization scripts
-COPY init.sql /docker-entrypoint-initdb.d/
+# Accept build argument for dump file
+ARG DUMP_FILE
+COPY ${DUMP_FILE} /docker-entrypoint-initdb.d/ 2>/dev/null || true
 
-# Copy data dump
-COPY dump.sql /tmp/dump.sql
+# Create initialization script that will restore the dump if DUMP_FILE is provided
+RUN if [ -n "$DUMP_FILE" ]; then \
+    echo '#!/bin/bash' > /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'set -e' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo '' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo '# Wait for PostgreSQL to start' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'until pg_isready -U $POSTGRES_USER; do' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo '  echo "Waiting for PostgreSQL to start..."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo '  sleep 1' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'done' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo '' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'echo "Restoring database from dump..."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo "pg_restore -U \$POSTGRES_USER -d \$POSTGRES_DB --clean --if-exists --no-owner /docker-entrypoint-initdb.d/$(basename $DUMP_FILE)" >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'echo "Database restore completed."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    chmod +x /docker-entrypoint-initdb.d/10-restore-dump.sh; \
+    fi

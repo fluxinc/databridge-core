@@ -97,6 +97,8 @@ services:
     build:
       context: .
       dockerfile: postgres.dockerfile
+      args:
+        - DUMP_FILE=${densebreast.dump:-}
     shm_size: 128mb
     environment:
       - POSTGRES_USER=morphik

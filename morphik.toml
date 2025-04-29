@@ -13,9 +13,10 @@ dev_permissions = ["read", "write", "admin"]  # Default dev permissions
 #### Registered models
 [registered_models]
 # OpenAI models
+openai_gpt4o = { model_name = "gpt-4o", vision = true }
 openai_gpt4 = { model_name = "gpt-4" }
 openai_gpt4-1 = { model_name = "gpt-4.1" }
-openai_gpt4o = { model_name = "gpt-4o" }
+openai_gpt4o_extraction = { model_name = "gpt-4o" }
 
 # Azure OpenAI models
 azure_gpt4 = { model_name = "gpt-4", api_base = "YOUR_AZURE_URL_HERE", api_version = "2023-05-15", deployment_id = "gpt-4-deployment" }
@@ -48,9 +49,9 @@ ollama_embedding_docker_docker = { model_name = "ollama/nomic-embed-text", api_b
 #### Component configurations ####
 
 [completion]
-model = "ollama_llama_vision"  # Reference to a key in registered_models
+model = "openai_gpt4o"  # Reference to a key in registered_models
 default_max_tokens = "1000"
-default_temperature = 0.5
+default_temperature = 0.2
 
 [database]
 provider = "postgres"
@@ -64,29 +65,29 @@ max_retries = 3          # Number of retries for database operations
 retry_delay = 1.0        # Initial delay between retries in seconds
 
 [embedding]
-model = "ollama_embedding"  # Reference to registered model
-dimensions = 768
-similarity_metric = "cosine"
+model = "openai_embedding"  # Reference to registered model
+dimensions = 1536
+similarity_metric = "dotProduct"
 
 [parser]
-chunk_size = 6000
-chunk_overlap = 300
+chunk_size = 1000
+chunk_overlap = 200
 use_unstructured_api = false
 use_contextual_chunking = false
-contextual_chunking_model = "ollama_llama"  # Reference to a key in registered_models
+contextual_chunking_model = "openai_gpt4"  # Reference to a key in registered_models
 
 [parser.vision]
-model = "ollama_llama_vision"  # Reference to a key in registered_models
+model = "openai_gpt4o"  # Reference to a key in registered_models
 frame_sample_rate = -1  # Set to -1 to disable frame captioning
 
 [reranker]
-use_reranker = true
-provider = "flag"
-model_name = "BAAI/bge-reranker-large"
-query_max_length = 256
-passage_max_length = 512
-use_fp16 = true
-device = "mps" # use "cpu" if on docker and using a mac, "cuda" if cuda enabled device
+use_reranker = false
+# provider = "flag"
+# model_name = "BAAI/bge-reranker-large"
+# query_max_length = 256
+# passage_max_length = 512
+# use_fp16 = true
+# device = "mps" # use "cpu" if on docker and using a mac, "cuda" if cuda enabled device
 
 [storage]
 provider = "local"
@@ -101,7 +102,7 @@ storage_path = "./storage"
 provider = "pgvector"
 
 [rules]
-model = "ollama_llama"
+model = "openai_gpt4"
 batch_size = 4096
 
 [morphik]
@@ -110,11 +111,11 @@ mode = "self_hosted"  # "cloud" or "self_hosted"
 api_domain = "api.morphik.ai"  # API domain for cloud URIs
 
 [redis]
-host = "localhost"  # use "redis" for docker
+host = "redis"  # use "redis" for docker
 port = 6379
 
 [graph]
-model = "ollama_llama"
+model = "openai_gpt4"
 enable_entity_resolution = true
 
 [telemetry]

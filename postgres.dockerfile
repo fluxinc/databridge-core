@@ -20,7 +20,7 @@ RUN apk del git build-base clang llvm postgresql17-dev \
 
 # Accept build argument for dump file
 ARG DUMP_FILE
-COPY ${DUMP_FILE} /docker-entrypoint-initdb.d/ 2>/dev/null || true
+COPY ${DUMP_FILE} /docker-entrypoint-initdb.d/
 
 # Create initialization script that will restore the dump if DUMP_FILE is provided
 RUN if [ -n "$DUMP_FILE" ]; then \

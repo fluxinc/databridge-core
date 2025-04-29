@@ -116,7 +116,10 @@ check_postgres() {\n\
         echo "Waiting for PostgreSQL..."\n\
         max_retries=30\n\
         retries=0\n\
-        until PGPASSWORD=$PGPASSWORD pg_isready -h postgres -U morphik -d morphik; do\n\
+        # Extract database credentials from POSTGRES_URI\n\
+        DB_USER=$(echo $POSTGRES_URI | sed -n 's/.*:\/\/\([^:]*\):.*/\1/p')\n\
+        DB_NAME=$(echo $POSTGRES_URI | sed -n 's/.*@[^\/]*\/\([^?]*\).*/\1/p')\n\
+        until PGPASSWORD=$PGPASSWORD pg_isready -h postgres -U $DB_USER -d $DB_NAME; do\n\
             retries=$((retries + 1))\n\
             if [ $retries -eq $max_retries ]; then\n\
                 echo "Error: PostgreSQL did not become ready in time"\n\
@@ -128,7 +131,7 @@ check_postgres() {\n\
         echo "PostgreSQL is ready!"\n\
         \n\
         # Verify database connection\n\
-        if ! PGPASSWORD=$PGPASSWORD psql -h postgres -U morphik -d morphik -c "SELECT 1" > /dev/null 2>&1; then\n\
+        if ! PGPASSWORD=$PGPASSWORD psql -h postgres -U $DB_USER -d $DB_NAME -c "SELECT 1" > /dev/null 2>&1; then\n\
             echo "Error: Could not connect to PostgreSQL database"\n\
             exit 1\n\
         fi\n\

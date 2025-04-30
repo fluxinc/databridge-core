@@ -284,12 +284,10 @@ def get_settings() -> Settings:
     }
 
     # load redis config
-    redis_config = {}
-    if "redis" in config:
-        redis_config = {
-            "REDIS_HOST": config["redis"].get("host", "localhost"),
-            "REDIS_PORT": int(config["redis"].get("port", 6379)),
-        }
+    redis_config = {
+        "REDIS_HOST": os.environ.get("REDIS_HOST", "localhost"),
+        "REDIS_PORT": int(os.environ.get("REDIS_PORT", 6379)),
+    }
 
     # load graph config
     graph_config = {

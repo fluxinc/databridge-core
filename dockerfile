@@ -93,10 +93,6 @@ use_unstructured_api = false\n\
 [reranker]\n\
 use_reranker = false\n\
 \n\
-[redis]\n\
-host = "redis"\n\
-port = 6379\n\
-\n\
 [storage]\n\
 provider = "local"\n\
 storage_path = "/app/storage"\n\

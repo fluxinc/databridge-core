@@ -110,10 +110,6 @@ enable_colpali = true
 mode = "self_hosted"  # "cloud" or "self_hosted"
 api_domain = "api.morphik.ai"  # API domain for cloud URIs
 
-[redis]
-host = "redis"  # use "redis" for docker
-port = 6379
-
 [graph]
 model = "openai_gpt4"
 enable_entity_resolution = true

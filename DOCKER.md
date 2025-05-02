@@ -2,6 +2,7 @@
 
 Morphik Core provides a streamlined Docker-based setup that includes all necessary components: the core API, PostgreSQL with pgvector, and Ollama for AI models.
 
+NOTE: If you are on Windows and get `exec /app/docker-entrypoint.sh: no such file or directory` then change the dockerfile line endlings to LF
 ## Prerequisites
 
 - Docker and Docker Compose installed on your system

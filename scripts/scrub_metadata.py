@@ -102,7 +102,7 @@ if __name__ == "__main__":
     # Get database URI based on environment
     if args.env == "docker":
         # Using Docker container
-        postgres_uri = "postgresql+asyncpg://morphik:morphik@localhost:5432/morphik"
+        postgres_uri = "postgresql+asyncpg://databridge:databridge@localhost:5432/databridge"
     else:
         # Using local .env file
         try:

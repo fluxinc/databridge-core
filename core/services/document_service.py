@@ -1024,10 +1024,16 @@ class DocumentService:
         download_urls = {}
         for doc_id, doc in doc_map.items():
             if doc.storage_info:
-                download_urls[doc_id] = await self.storage.get_download_url(
-                    doc.storage_info["bucket"], doc.storage_info["key"]
-                )
-                logger.debug(f"Generated download URL for document {doc_id}")
+                try:
+                    download_urls[doc_id] = await self.storage.get_download_url(
+                        doc.storage_info["bucket"], doc.storage_info["key"]
+                    )
+                    if download_urls[doc_id] == "":
+                        raise Exception("Download URL returned empty string")
+                    logger.debug(f"Generated download URL for document {doc_id}")
+                except Exception as e:
+                    logger.error(f"Failed to generate download URL for document {doc_id}: {e}")
+                    download_urls[doc_id] = None
 
         # Create chunk results using the lookup dictionaries
         for chunk in chunks:
@@ -1081,10 +1087,16 @@ class DocumentService:
         download_urls = {}
         for doc_id, doc in doc_map.items():
             if doc.content_type != "text/plain" and doc.storage_info:
-                download_urls[doc_id] = await self.storage.get_download_url(
-                    doc.storage_info["bucket"], doc.storage_info["key"]
-                )
-                logger.debug(f"Generated download URL for document {doc_id}")
+                try:
+                    download_urls[doc_id] = await self.storage.get_download_url(
+                        doc.storage_info["bucket"], doc.storage_info["key"]
+                    )
+                    if download_urls[doc_id] == "":
+                        raise Exception("Download URL returned empty string")
+                    logger.debug(f"Generated download URL for document {doc_id}")
+                except Exception as e:
+                    logger.error(f"Failed to generate download URL for document {doc_id}: {e}")
+                    download_urls[doc_id] = None
 
         # Create document results using the lookup dictionaries
         results = {}

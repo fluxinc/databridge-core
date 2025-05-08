@@ -21,11 +21,13 @@ services:
       - "8000:8000"
     environment:
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key-here}
-      - POSTGRES_URI=${POSTGRES_URI:-postgresql+asyncpg://databridge:databridge@postgres:5432/databridge}
-      - PGPASSWORD=databridge
-      - HOST=0.0.0.0
-      - PORT=8000
-      - LOG_LEVEL=DEBUG
+      - PGPASSWORD=${PGPASSWORD}
+      - PGUSER=${PGUSER}
+      - PGDATABASE=${PGDATABASE}
+      - POSTGRES_URI=postgresql+asyncpg://${PGUSER}:${PGPASSWORD}@postgres:${PGPORT}/${PGDATABASE}
+      - HOST=${DATABRIDGE_HOST:-0.0.0.0}
+      - PORT=${DATABRIDGE_PORT:-8000}
+      - LOG_LEVEL=${DATABRIDGE_LOG_LEVEL:-DEBUG}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
@@ -101,22 +103,27 @@ services:
         - DUMP_FILE=densebreast.dump
     shm_size: 128mb
     environment:
-      - POSTGRES_USER=databridge
-      - POSTGRES_PASSWORD=databridge
-      - POSTGRES_DB=databridge
+      - POSTGRES_USER=${PGUSER}
+      - POSTGRES_PASSWORD=${PGPASSWORD}
+      - POSTGRES_DB=${PGDATABASE}
+      - POSTGRES_PORT=${PGPORT}
       - PGDATA=/var/lib/postgresql/data/pgdata
     ports:
-      - "5432:5432"
+      - "${PGPORT}:${PGPORT}"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - type: volume
+        source: postgres_data
+        target: /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U databridge -d databridge"]
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER} -d ${PGDATABASE}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
       - morphik-network
+    env_file:
+      - .env
 
   ollama:
     image: ollama/ollama:latest
@@ -125,8 +132,13 @@ services:
     ports:
       - "11434:11434"
     volumes:
-      - ollama_data:/root/.ollama
-      - ./ollama-entrypoint.sh:/ollama-entrypoint.sh
+      - type: volume
+        source: ollama_data
+        target: /root/.ollama
+      - type: bind
+        source: ./ollama-entrypoint.sh
+        target: /ollama-entrypoint.sh
+        read_only: true
     networks:
       - morphik-network
     entrypoint: ["/ollama-entrypoint.sh"]

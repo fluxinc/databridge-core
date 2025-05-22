@@ -35,5 +35,7 @@ RUN if [ -n "$DUMP_FILE" ]; then \
     echo 'echo "Restoring database from dump..."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     echo "pg_restore -U \$POSTGRES_USER -d \$POSTGRES_DB --clean --if-exists --no-owner /$DUMP_FILE" >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     echo 'echo "Database restore completed."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'touch /tmp/restore_completed' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo 'echo "Restore completed signal file created."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     chmod +x /docker-entrypoint-initdb.d/10-restore-dump.sh; \
     fi

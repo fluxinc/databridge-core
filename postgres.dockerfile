@@ -20,7 +20,6 @@ RUN apk del git build-base clang llvm postgresql17-dev \
 
 # Accept build argument for dump file
 ARG DUMP_FILE
-COPY ${DUMP_FILE} /docker-entrypoint-initdb.d/
 
 # Create initialization script that will restore the dump if DUMP_FILE is provided
 RUN if [ -n "$DUMP_FILE" ]; then \
@@ -34,7 +33,7 @@ RUN if [ -n "$DUMP_FILE" ]; then \
     echo 'done' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     echo '' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     echo 'echo "Restoring database from dump..."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
-    echo "pg_restore -U \$POSTGRES_USER -d \$POSTGRES_DB --clean --if-exists --no-owner /docker-entrypoint-initdb.d/$(basename $DUMP_FILE)" >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
+    echo "pg_restore -U \$POSTGRES_USER -d \$POSTGRES_DB --clean --if-exists --no-owner /$DUMP_FILE" >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     echo 'echo "Database restore completed."' >> /docker-entrypoint-initdb.d/10-restore-dump.sh && \
     chmod +x /docker-entrypoint-initdb.d/10-restore-dump.sh; \
     fi

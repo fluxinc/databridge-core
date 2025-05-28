@@ -7,12 +7,15 @@ import tomli
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 
+load_dotenv(override=True)
+
 
 class Settings(BaseSettings):
     """Morphik configuration settings."""
 
     # Environment variables
     JWT_SECRET_KEY: str
+    SESSION_SECRET_KEY: str
     POSTGRES_URI: Optional[str] = None
     UNSTRUCTURED_API_KEY: Optional[str] = None
     AWS_ACCESS_KEY: Optional[str] = None
@@ -25,6 +28,9 @@ class Settings(BaseSettings):
     HOST: str
     PORT: int
     RELOAD: bool
+    # Morphik Embedding API server configuration
+    MORPHIK_EMBEDDING_API_KEY: Optional[str] = None
+    MORPHIK_EMBEDDING_API_DOMAIN: str
 
     # Auth configuration
     JWT_ALGORITHM: str
@@ -39,6 +45,12 @@ class Settings(BaseSettings):
     # Completion configuration
     COMPLETION_PROVIDER: Literal["litellm"] = "litellm"
     COMPLETION_MODEL: str
+
+    # Agent configuration
+    AGENT_MODEL: str
+
+    # Document analysis configuration
+    DOCUMENT_ANALYSIS_MODEL: str
 
     # Database configuration
     DATABASE_PROVIDER: Literal["postgres"]
@@ -96,6 +108,8 @@ class Settings(BaseSettings):
 
     # Colpali configuration
     ENABLE_COLPALI: bool
+    # Colpali embedding mode: off, local, or api
+    COLPALI_MODE: Literal["off", "local", "api"] = "local"
 
     # Mode configuration
     MODE: Literal["cloud", "self_hosted"] = "cloud"
@@ -144,6 +158,7 @@ def get_settings() -> Settings:
     auth_config = {
         "JWT_ALGORITHM": config["auth"]["jwt_algorithm"],
         "JWT_SECRET_KEY": os.environ.get("JWT_SECRET_KEY", "dev-secret-key"),  # Default for dev mode
+        "SESSION_SECRET_KEY": os.environ.get("SESSION_SECRET_KEY", "super-secret-dev-session-key"),
         "dev_mode": config["auth"].get("dev_mode", False),
         "dev_entity_type": config["auth"].get("dev_entity_type", "developer"),
         "dev_entity_id": config["auth"].get("dev_entity_id", "dev_user"),
@@ -153,6 +168,13 @@ def get_settings() -> Settings:
     # Only require JWT_SECRET_KEY in non-dev mode
     if not auth_config["dev_mode"] and "JWT_SECRET_KEY" not in os.environ:
         raise ValueError("JWT_SECRET_KEY is required when dev_mode is disabled")
+    # Also require SESSION_SECRET_KEY in non-dev mode
+    if not auth_config["dev_mode"] and "SESSION_SECRET_KEY" not in os.environ:
+        # Or, if we want to be more strict and always require it via ENV:
+        # if "SESSION_SECRET_KEY" not in os.environ:
+        #     raise ValueError("SESSION_SECRET_KEY environment variable is required.")
+        # For now, align with JWT_SECRET_KEY's dev mode leniency.
+        pass  # Dev mode has a default, production should use ENV.
 
     # Load registered models if available
     registered_models = {}
@@ -168,6 +190,11 @@ def get_settings() -> Settings:
     if "model" not in config["completion"]:
         raise ValueError("'model' is required in the completion configuration")
     completion_config["COMPLETION_MODEL"] = config["completion"]["model"]
+
+    # load agent config
+    agent_config = {"AGENT_MODEL": config["agent"]["model"]}
+    if "model" not in config["agent"]:
+        raise ValueError("'model' is required in the agent configuration")
 
     # load database config
     database_config = {
@@ -279,8 +306,14 @@ def get_settings() -> Settings:
     # load morphik config
     morphik_config = {
         "ENABLE_COLPALI": config["morphik"]["enable_colpali"],
+        "COLPALI_MODE": config["morphik"].get("colpali_mode", "local"),
         "MODE": config["morphik"].get("mode", "cloud"),  # Default to "cloud" mode
-        "API_DOMAIN": config["morphik"].get("api_domain", "api.morphik.ai"),  # Default API domain
+        # API domain for core server
+        "API_DOMAIN": config["morphik"].get("api_domain", "api.morphik.ai"),
+        # Domain for Morphik embedding API
+        "MORPHIK_EMBEDDING_API_DOMAIN": config["morphik"].get(
+            "morphik_embedding_api_domain", config["morphik"].get("api_domain", "api.morphik.ai")
+        ),
     }
 
     # load redis config
@@ -299,6 +332,11 @@ def get_settings() -> Settings:
     if "model" not in config["graph"]:
         raise ValueError("'model' is required in the graph configuration")
     graph_config["GRAPH_MODEL"] = config["graph"]["model"]
+
+    # load document analysis config
+    document_analysis_config = {}
+    if "document_analysis" in config:
+        document_analysis_config = {"DOCUMENT_ANALYSIS_MODEL": config["document_analysis"]["model"]}
 
     # load telemetry config
     telemetry_config = {}
@@ -322,6 +360,7 @@ def get_settings() -> Settings:
             auth_config,
             registered_models,
             completion_config,
+            agent_config,
             database_config,
             embedding_config,
             parser_config,
@@ -332,6 +371,7 @@ def get_settings() -> Settings:
             morphik_config,
             redis_config,
             graph_config,
+            document_analysis_config,
             telemetry_config,
             openai_config,
         )

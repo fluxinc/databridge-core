@@ -1,17 +1,20 @@
 import asyncio
 import base64
+import json
 import logging
 import os
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Type, Union
 
+import arq
 import filetype
 import pdf2image
 import torch
 from colpali_engine.models import ColIdefics3, ColIdefics3Processor
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 from filetype.types import IMAGE  # , DOCUMENT, document
 from PIL.Image import Image
 from pydantic import BaseModel
@@ -23,6 +26,8 @@ from core.config import get_settings
 from core.database.base_database import BaseDatabase
 from core.embedding.base_embedding_model import BaseEmbeddingModel
 from core.embedding.colpali_embedding_model import ColpaliEmbeddingModel
+from core.limits_utils import check_and_increment_limits, estimate_pages_by_chars
+from core.models.chat import ChatMessage
 from core.models.chunk import Chunk, DocumentChunk
 from core.models.completion import ChunkSource, CompletionRequest, CompletionResponse
 from core.models.documents import ChunkResult, Document, DocumentContent, DocumentResult, StorageFileInfo
@@ -47,7 +52,9 @@ TOKENS_PER_PAGE = 630
 
 
 class DocumentService:
-    async def _ensure_folder_exists(self, folder_name: str, document_id: str, auth: AuthContext) -> Optional[Folder]:
+    async def _ensure_folder_exists(
+        self, folder_name: Union[str, List[str]], document_id: str, auth: AuthContext
+    ) -> Optional[Folder]:
         """
         Check if a folder exists, if not create it. Also adds the document to the folder.
 
@@ -60,6 +67,13 @@ class DocumentService:
             Folder object if found or created, None on error
         """
         try:
+            # If multiple folders provided, ensure each exists and contains the document
+            if isinstance(folder_name, list):
+                last_folder = None
+                for fname in folder_name:
+                    last_folder = await self._ensure_folder_exists(fname, document_id, auth)
+                return last_folder
+
             # First check if the folder already exists
             folder = await self.db.get_folder_by_name(folder_name, auth)
             if folder:
@@ -79,6 +93,10 @@ class DocumentService:
                 },
                 document_ids=[document_id],  # Add document_id to the new folder
             )
+
+            # Scope folder to the application ID for developer tokens
+            if auth.app_id:
+                folder.system_metadata["app_id"] = auth.app_id
 
             await self.db.create_folder(folder)
             return folder
@@ -144,7 +162,7 @@ class DocumentService:
         min_score: float = 0.0,
         use_reranking: Optional[bool] = None,
         use_colpali: Optional[bool] = None,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
     ) -> List[ChunkResult]:
         """Retrieve relevant chunks."""
@@ -159,17 +177,20 @@ class DocumentService:
         should_rerank = use_reranking if use_reranking is not None else settings.USE_RERANKING
         using_colpali = use_colpali if use_colpali is not None else False
 
+        # Build system filters for folder_name and end_user_id
+        system_filters = {}
+        if folder_name:
+            # Allow folder_name to be a single string or list[str]
+            system_filters["folder_name"] = folder_name
+        if end_user_id:
+            system_filters["end_user_id"] = end_user_id
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
         # Launch embedding queries concurrently
         embedding_tasks = [self.embedding_model.embed_for_query(query)]
         if using_colpali and self.colpali_embedding_model:
             embedding_tasks.append(self.colpali_embedding_model.embed_for_query(query))
-
-        # Build system filters for folder_name and end_user_id
-        system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
-        if end_user_id:
-            system_filters["end_user_id"] = end_user_id
 
         # Run embeddings and document authorization in parallel
         results = await asyncio.gather(
@@ -317,7 +338,7 @@ class DocumentService:
         min_score: float = 0.0,
         use_reranking: Optional[bool] = None,
         use_colpali: Optional[bool] = None,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
     ) -> List[DocumentResult]:
         """Retrieve relevant documents."""
@@ -335,7 +356,7 @@ class DocumentService:
         self,
         document_ids: List[str],
         auth: AuthContext,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
     ) -> List[Document]:
         """
@@ -357,6 +378,8 @@ class DocumentService:
             system_filters["folder_name"] = folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         # Use the database's batch retrieval method
         documents = await self.db.get_documents_by_id(document_ids, auth, system_filters)
@@ -367,7 +390,7 @@ class DocumentService:
         self,
         chunk_ids: List[ChunkSource],
         auth: AuthContext,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
         use_colpali: Optional[bool] = None,
     ) -> List[ChunkResult]:
@@ -468,9 +491,10 @@ class DocumentService:
         hop_depth: int = 1,
         include_paths: bool = False,
         prompt_overrides: Optional["QueryPromptOverrides"] = None,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
         schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = None,
+        chat_history: Optional[List[ChatMessage]] = None,
     ) -> CompletionResponse:
         """Generate completion using relevant chunks as context.
 
@@ -543,6 +567,7 @@ class DocumentService:
             temperature=temperature,
             prompt_template=custom_prompt_template,
             schema=schema,
+            chat_history=chat_history,
         )
 
         response = await self.completion_model.complete(request)
@@ -582,9 +607,7 @@ class DocumentService:
                 "readers": [auth.entity_id],
                 "writers": [auth.entity_id],
                 "admins": [auth.entity_id],
-                "user_id": (
-                    [auth.user_id] if auth.user_id else []
-                ),  # Add user_id to access control for filtering (as a list)
+                "user_id": [auth.user_id if auth.user_id else []],  # user scoping
             },
         )
 
@@ -597,14 +620,23 @@ class DocumentService:
 
         if end_user_id:
             doc.system_metadata["end_user_id"] = end_user_id
+
+        # Tag document with app_id for segmentation
+        if auth.app_id:
+            doc.system_metadata["app_id"] = auth.app_id
+
         logger.debug(f"Created text document record with ID {doc.external_id}")
 
         if settings.MODE == "cloud" and auth.user_id:
-            # Check limits before proceeding
-            from core.api import check_and_increment_limits
-
-            num_pages = int(len(content) / (CHARS_PER_TOKEN * TOKENS_PER_PAGE))  #
-            await check_and_increment_limits(auth, "ingest", num_pages, doc.external_id)
+            # Verify limits before heavy processing
+            num_pages = estimate_pages_by_chars(len(content))
+            await check_and_increment_limits(
+                auth,
+                "ingest",
+                num_pages,
+                doc.external_id,
+                verify_only=True,
+            )
 
         # === Apply post_parsing rules ===
         document_rule_metadata = {}
@@ -696,6 +728,232 @@ class DocumentService:
         )
         logger.debug(f"Updated document status to 'completed' for {doc.external_id}")
 
+        # Determine the final page count for usage recording
+        colpali_count_for_limit_fn = (
+            len(chunk_objects_multivector) if use_colpali and chunk_objects_multivector else None
+        )
+        final_page_count = estimate_pages_by_chars(len(content))
+        if use_colpali and colpali_count_for_limit_fn is not None:
+            final_page_count = colpali_count_for_limit_fn
+        final_page_count = max(1, final_page_count)  # Ensure minimum of 1 page
+        logger.info(f"Determined final page count for ingest_text usage: {final_page_count}")
+
+        # Record ingest usage after successful completion
+        if settings.MODE == "cloud" and auth.user_id:
+            try:
+                await check_and_increment_limits(
+                    auth,
+                    "ingest",
+                    final_page_count,  # Use the determined final count
+                    doc.external_id,
+                    use_colpali=use_colpali,  # Pass colpali status
+                    colpali_chunks_count=colpali_count_for_limit_fn,  # Pass actual colpali count
+                )
+            except Exception as rec_exc:
+                # Log error but don't fail the synchronous request at this point
+                logger.error("Failed to record ingest usage in ingest_text: %s", rec_exc)
+
+        return doc
+
+    async def ingest_file_content(
+        self,
+        file_content_bytes: bytes,
+        filename: str,
+        content_type: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        auth: AuthContext,
+        redis: arq.ArqRedis,
+        folder_name: Optional[Union[str, List[str]]] = None,
+        end_user_id: Optional[str] = None,
+        rules: Optional[List[str]] = None,
+        use_colpali: Optional[bool] = False,
+    ) -> Document:
+        """
+        Ingests file content from bytes. Saves to storage, creates document record,
+        and then enqueues a background job for chunking and embedding.
+        """
+        settings = get_settings()
+
+        logger.info(
+            f"Starting ingestion for filename: {filename}, content_type: {content_type}, "
+            f"user: {auth.user_id or auth.entity_id}"
+        )
+
+        # Ensure user has write permission
+        if "write" not in auth.permissions:
+            logger.error(f"User {auth.entity_id} does not have write permission for ingest_file_content")
+            raise PermissionError("User does not have write permission for ingest_file_content")
+
+        doc = Document(
+            filename=filename,
+            content_type=content_type,
+            owner={"type": auth.entity_type.value, "id": auth.entity_id},
+            metadata=metadata or {},
+            system_metadata={"status": "processing"},  # Initial status
+            content_info={"type": "file", "mime_type": content_type},
+            # Ensure access_control is set similar to /ingest/file
+            access_control={
+                "readers": [auth.entity_id],
+                "writers": [auth.entity_id],
+                "admins": [auth.entity_id],
+                "user_id": [auth.user_id] if auth.user_id else [],
+                "app_access": ([auth.app_id] if auth.app_id else []),
+            },
+        )
+
+        if auth.app_id:
+            doc.system_metadata["app_id"] = auth.app_id
+        if end_user_id:
+            doc.system_metadata["end_user_id"] = end_user_id
+        # folder_name is handled later by _ensure_folder_exists if needed by background worker
+
+        # --------------------------------------------------------
+        # Verify quotas before incurring heavy compute or storage
+        # --------------------------------------------------------
+        if settings.MODE == "cloud" and auth.user_id:
+            num_pages = estimate_pages_by_chars(len(file_content_bytes))
+
+            # Dry-run checks; nothing is recorded yet
+            await check_and_increment_limits(
+                auth,
+                "ingest",
+                num_pages,
+                doc.external_id,
+                verify_only=True,
+            )
+            await check_and_increment_limits(auth, "storage_file", 1, verify_only=True)
+            await check_and_increment_limits(
+                auth,
+                "storage_size",
+                len(file_content_bytes),
+                verify_only=True,
+            )
+            logger.info(
+                "Quota verification passed for user %s – pages=%s, file=%s bytes",
+                auth.user_id,
+                num_pages,
+                len(file_content_bytes),
+            )
+
+        # 1. Create initial document record in DB
+        # The app_db concept from core/api.py implies self.db is already app-specific if needed
+        await self.db.store_document(doc)
+        logger.info(f"Initial document record created for {filename} (doc_id: {doc.external_id})")
+
+        # 2. Save raw file to Storage
+        # Using a unique key structure similar to /ingest/file to avoid collisions if worker needs it
+        file_key_suffix = str(uuid.uuid4())
+        storage_key = f"ingest_uploads/{file_key_suffix}/{filename}"
+        content_base64 = base64.b64encode(file_content_bytes).decode("utf-8")
+
+        try:
+            bucket_name, full_storage_path = await self._upload_to_app_bucket(
+                auth=auth, content_base64=content_base64, key=storage_key, content_type=content_type
+            )
+            # Create StorageFileInfo with version as INT
+            sfi = StorageFileInfo(
+                bucket=bucket_name,
+                key=full_storage_path,
+                content_type=content_type,
+                size=len(file_content_bytes),
+                last_modified=datetime.now(UTC),
+                version=1,  # INT, as per StorageFileInfo model
+                filename=filename,
+            )
+            # Populate legacy doc.storage_info (Dict[str, str]) with stringified values
+            doc.storage_info = {k: str(v) if v is not None else "" for k, v in sfi.model_dump().items()}
+
+            # Initialize storage_files list with the StorageFileInfo object (version remains int)
+            doc.storage_files = [sfi]
+
+            await self.db.update_document(
+                document_id=doc.external_id,
+                updates={
+                    "storage_info": doc.storage_info,  # This is now Dict[str, str]
+                    "storage_files": [sf.model_dump() for sf in doc.storage_files],  # Dumps SFI, version is int
+                    "system_metadata": doc.system_metadata,  # system_metadata already has status processing
+                },
+                auth=auth,
+            )
+            logger.info(
+                "File %s (doc_id: %s) uploaded to storage at %s/%s and DB updated.",
+                filename,
+                doc.external_id,
+                bucket_name,
+                full_storage_path,
+            )
+
+            # -----------------------------------
+            # Record usage now that upload passed
+            # -----------------------------------
+            if settings.MODE == "cloud" and auth.user_id:
+                try:
+                    await check_and_increment_limits(auth, "storage_file", 1)
+                    await check_and_increment_limits(auth, "storage_size", len(file_content_bytes))
+                except Exception as rec_err:
+                    logger.error("Failed recording usage for doc %s: %s", doc.external_id, rec_err)
+
+        except Exception as e:
+            logger.error(f"Failed to upload file {filename} (doc_id: {doc.external_id}) to storage or update DB: {e}")
+            # Update document status to failed if initial storage fails
+            doc.system_metadata["status"] = "failed"
+            doc.system_metadata["error"] = f"Storage upload/DB update failed: {str(e)}"
+            try:
+                await self.db.update_document(doc.external_id, {"system_metadata": doc.system_metadata}, auth=auth)
+            except Exception as db_update_err:
+                logger.error(f"Additionally failed to mark doc {doc.external_id} as failed in DB: {db_update_err}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload file to storage: {str(e)}")
+
+        # 3. Ensure folder exists if folder_name is provided (after doc is created)
+        if folder_name:
+            try:
+                await self._ensure_folder_exists(folder_name, doc.external_id, auth)
+                logger.debug(f"Ensured folder '{folder_name}' exists " f"and contains document {doc.external_id}")
+            except Exception as e:
+                logger.error(
+                    f"Error during _ensure_folder_exists for doc {doc.external_id}"
+                    f"in folder {folder_name}: {e}. Continuing."
+                )
+
+        # 4. Enqueue background job for processing
+        auth_dict = {
+            "entity_type": auth.entity_type.value,
+            "entity_id": auth.entity_id,
+            "app_id": auth.app_id,
+            "permissions": list(auth.permissions),
+            "user_id": auth.user_id,
+        }
+
+        metadata_json_str = json.dumps(metadata or {})
+        rules_list_for_job = rules or []
+
+        try:
+            job = await redis.enqueue_job(
+                "process_ingestion_job",
+                document_id=doc.external_id,
+                file_key=full_storage_path,  # This is the key in storage
+                bucket=bucket_name,
+                original_filename=filename,
+                content_type=content_type,
+                metadata_json=metadata_json_str,
+                auth_dict=auth_dict,
+                rules_list=rules_list_for_job,
+                use_colpali=use_colpali,
+                folder_name=str(folder_name) if folder_name else None,  # Ensure folder_name is str or None
+                end_user_id=end_user_id,
+            )
+            logger.info(f"Connector file ingestion job queued with ID: {job.job_id} for document: {doc.external_id}")
+        except Exception as e:
+            logger.error(f"Failed to enqueue ingestion job for doc {doc.external_id} ({filename}): {e}")
+            # Update document status to failed if enqueuing fails
+            doc.system_metadata["status"] = "failed"
+            doc.system_metadata["error"] = f"Failed to enqueue processing job: {str(e)}"
+            try:
+                await self.db.update_document(doc.external_id, {"system_metadata": doc.system_metadata}, auth=auth)
+            except Exception as db_update_err:
+                logger.error(f"Additionally failed to mark doc {doc.external_id} as failed in DB: {db_update_err}")
+            raise HTTPException(status_code=500, detail=f"Failed to enqueue document processing job: {str(e)}")
+
         return doc
 
     def img_to_base64_str(self, img: Image):
@@ -711,10 +969,47 @@ class DocumentService:
         mime_type = file_type.mime if file_type is not None else "text/plain"
         logger.info(f"Creating chunks for multivector embedding for file type {mime_type}")
 
-        # If file_type is None, treat it as a text file
+        # If file_type is None, attempt a light-weight heuristic to detect images
+        # Some JPGs with uncommon EXIF markers fail `filetype.guess`, leading to
+        # false "text" classification and, eventually, empty chunk lists. Try to
+        # open the bytes with Pillow; if that succeeds, treat it as an image.
         if file_type is None:
-            logger.info("File type is None, treating as text")
-            return [Chunk(content=chunk.content, metadata=(chunk.metadata | {"is_image": False})) for chunk in chunks]
+            try:
+                from PIL import Image as PILImage
+
+                PILImage.open(BytesIO(file_content)).verify()
+                logger.info("Heuristic image detection succeeded (Pillow). Treating as image.")
+                return [Chunk(content=file_content_base64, metadata={"is_image": True})]
+            except Exception:
+                logger.info("File type is None and not an image – treating as text")
+                return [
+                    Chunk(content=chunk.content, metadata=(chunk.metadata | {"is_image": False})) for chunk in chunks
+                ]
+
+        # Treat any direct image MIME (e.g. "image/jpeg") as an image regardless of
+        # the more specialised pattern matching below. This is more robust for files
+        # where `filetype.guess` fails but we still know from the upload metadata that
+        # it is an image.
+        if mime_type.startswith("image/"):
+            try:
+                from PIL import Image as PILImage
+
+                img = PILImage.open(BytesIO(file_content))
+                # Resize and compress aggressively to minimize context window footprint
+                max_width = 256  # reduce width to shrink payload dramatically
+                if img.width > max_width:
+                    ratio = max_width / float(img.width)
+                    new_height = int(float(img.height) * ratio)
+                    img = img.resize((max_width, new_height))
+
+                buffered = BytesIO()
+                # Save as JPEG with moderate quality instead of PNG to reduce size further
+                img.convert("RGB").save(buffered, format="JPEG", quality=70, optimize=True)
+                img_b64 = "data:image/jpeg;base64," + base64.b64encode(buffered.getvalue()).decode()
+                return [Chunk(content=img_b64, metadata={"is_image": True})]
+            except Exception as e:
+                logger.error(f"Error resizing image for base64 encoding: {e}. Falling back to original size.")
+                return [Chunk(content=file_content_base64, metadata={"is_image": True})]
 
         match mime_type:
             case file_type if file_type in IMAGE:
@@ -1256,6 +1551,18 @@ class DocumentService:
                 file, doc, metadata, rules
             )
             await self._update_storage_info(doc, file, file_content_base64)
+
+            # ------------------------------------------------------------------
+            # Record storage usage for the newly uploaded file (cloud mode)
+            # ------------------------------------------------------------------
+            settings = get_settings()
+            if settings.MODE == "cloud" and auth.user_id:
+                try:
+                    await check_and_increment_limits(auth, "storage_file", 1)
+                    await check_and_increment_limits(auth, "storage_size", len(file_content))
+                except Exception as rec_err:  # noqa: BLE001
+                    # Do not fail the update on metering issues – just log
+                    logger.error("Failed to record storage usage in update_document: %s", rec_err)
         elif not metadata_only_update:
             logger.error("Neither content nor file provided for document update")
             return None
@@ -1458,24 +1765,31 @@ class DocumentService:
         # The version is based on the current length of storage_files to ensure correct versioning
         version = len(doc.storage_files) + 1
         file_extension = os.path.splitext(file.filename)[1] if file.filename else ""
-        storage_info = await self.storage.upload_from_base64(
-            file_content_base64, f"{doc.external_id}_{version}{file_extension}", file.content_type
+
+        # Route file uploads to the dedicated app bucket when available
+        bucket_override = await self._get_bucket_for_app(doc.system_metadata.get("app_id"))
+
+        storage_info_tuple = await self.storage.upload_from_base64(
+            file_content_base64,
+            f"{doc.external_id}_{version}{file_extension}",
+            file.content_type,
+            bucket=bucket_override or "",
         )
 
-        # Add the new file to storage_files
-        new_file_info = StorageFileInfo(
-            bucket=storage_info[0],
-            key=storage_info[1],
-            version=version,
+        # Add the new file to storage_files, version is INT
+        new_sfi = StorageFileInfo(
+            bucket=storage_info_tuple[0],
+            key=storage_info_tuple[1],
+            version=version,  # version variable is already an int
             filename=file.filename,
             content_type=file.content_type,
             timestamp=datetime.now(UTC),
         )
-        doc.storage_files.append(new_file_info)
+        doc.storage_files.append(new_sfi)
 
-        # Still update legacy storage_info with the latest file for backward compatibility
-        doc.storage_info = {"bucket": storage_info[0], "key": storage_info[1]}
-        logger.info(f"Stored file in bucket `{storage_info[0]}` with key `{storage_info[1]}`")
+        # Still update legacy storage_info (Dict[str, str]) with the latest file, stringifying values
+        doc.storage_info = {k: str(v) if v is not None else "" for k, v in new_sfi.model_dump().items()}
+        logger.info(f"Stored file in bucket `{storage_info_tuple[0]}` with key `{storage_info_tuple[1]}`")
 
     def _apply_update_strategy(self, current_content: str, update_content: str, update_strategy: str) -> str:
         """Apply the update strategy to combine current and new content."""
@@ -1486,64 +1800,6 @@ class DocumentService:
             # For now, just use 'add' as default strategy
             logger.warning(f"Unknown update strategy '{update_strategy}', defaulting to 'add'")
             return current_content + "\n\n" + update_content
-
-    def _update_metadata_and_version(
-        self,
-        doc: Document,
-        metadata: Optional[Dict[str, Any]],
-        update_strategy: str,
-        file: Optional[UploadFile],
-    ):
-        """Update document metadata and version tracking."""
-        # Update metadata if provided - additive but replacing existing keys
-        if metadata:
-            doc.metadata.update(metadata)
-
-        # Ensure external_id is preserved in metadata
-        doc.metadata["external_id"] = doc.external_id
-
-        # Increment version
-        current_version = doc.system_metadata.get("version", 1)
-        doc.system_metadata["version"] = current_version + 1
-        doc.system_metadata["updated_at"] = datetime.now(UTC)
-
-        # Track update history
-        if "update_history" not in doc.system_metadata:
-            doc.system_metadata["update_history"] = []
-
-        update_entry = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "version": current_version + 1,
-            "strategy": update_strategy,
-        }
-
-        if file:
-            update_entry["filename"] = file.filename
-
-        if metadata:
-            update_entry["metadata_updated"] = True
-
-        doc.system_metadata["update_history"].append(update_entry)
-
-        # Ensure storage_files models are properly typed as StorageFileInfo objects
-        if hasattr(doc, "storage_files") and doc.storage_files:
-            # Convert to StorageFileInfo objects if they're dicts or ensure they're properly serializable
-            doc.storage_files = [
-                (
-                    StorageFileInfo(**file)
-                    if isinstance(file, dict)
-                    else (
-                        file
-                        if isinstance(file, StorageFileInfo)
-                        else (
-                            StorageFileInfo(**file.model_dump())
-                            if hasattr(file, "model_dump")
-                            else StorageFileInfo(**file.dict()) if hasattr(file, "dict") else file
-                        )
-                    )
-                )
-                for file in doc.storage_files
-            ]
 
     async def _update_document_metadata_only(self, doc: Document, auth: AuthContext) -> Optional[Document]:
         """Update document metadata without reprocessing chunks."""
@@ -1693,6 +1949,7 @@ class DocumentService:
         additional_documents: Optional[List[str]] = None,
         prompt_overrides: Optional[GraphPromptOverrides] = None,
         system_filters: Optional[Dict[str, Any]] = None,
+        is_initial_build: bool = False,  # New parameter
     ) -> Graph:
         """Update an existing graph with new documents.
 
@@ -1706,6 +1963,7 @@ class DocumentService:
             additional_documents: Optional list of additional document IDs to include
             prompt_overrides: Optional customizations for entity extraction and resolution prompts
             system_filters: Optional system filters like folder_name and end_user_id for scoping
+            is_initial_build: Whether this is the initial build of the graph
 
         Returns:
             Graph: The updated graph
@@ -1719,6 +1977,7 @@ class DocumentService:
             additional_documents=additional_documents,
             prompt_overrides=prompt_overrides,
             system_filters=system_filters,
+            is_initial_build=is_initial_build,  # Pass through
         )
 
     async def delete_document(self, document_id: str, auth: AuthContext) -> bool:
@@ -1790,8 +2049,8 @@ class DocumentService:
         # Also handle the case of multiple file versions in storage_files
         if hasattr(document, "storage_files") and document.storage_files:
             for file_info in document.storage_files:
-                bucket = file_info.get("bucket")
-                key = file_info.get("key")
+                bucket = file_info.bucket
+                key = file_info.key
                 if bucket and key and hasattr(self.storage, "delete_file"):
                     storage_deletion_tasks.append(self.storage.delete_file(bucket, key))
 
@@ -1821,3 +2080,77 @@ class DocumentService:
         """Close all resources."""
         # Close any active caches
         self.active_caches.clear()
+
+    def _update_metadata_and_version(
+        self,
+        doc: Document,
+        metadata: Optional[Dict[str, Any]],
+        update_strategy: str,
+        file: Optional[UploadFile],
+    ):
+        """Update document metadata and version tracking."""
+
+        # Merge/replace metadata
+        if metadata:
+            doc.metadata.update(metadata)
+
+        # Ensure external_id is preserved
+        doc.metadata["external_id"] = doc.external_id
+
+        # Increment version counter
+        current_version = doc.system_metadata.get("version", 1)
+        doc.system_metadata["version"] = current_version + 1
+        doc.system_metadata["updated_at"] = datetime.now(UTC)
+
+        # Maintain simple history list
+        history = doc.system_metadata.setdefault("update_history", [])
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "version": current_version + 1,
+            "strategy": update_strategy,
+        }
+        if file:
+            entry["filename"] = file.filename
+        if metadata:
+            entry["metadata_updated"] = True
+
+        history.append(entry)
+
+    # ------------------------------------------------------------------
+    # Helper – choose bucket per app (isolation)
+    # ------------------------------------------------------------------
+
+    async def _get_bucket_for_app(self, app_id: str | None) -> str | None:
+        """Return dedicated bucket for *app_id* if catalog entry exists."""
+        if not app_id:
+            return None
+
+        try:
+            from sqlalchemy import select
+            from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+            from sqlalchemy.orm import sessionmaker
+
+            from core.models.app_metadata import AppMetadataModel
+
+            settings = get_settings()
+
+            engine = create_async_engine(settings.POSTGRES_URI)
+            async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+            async with async_session() as sess:
+                result = await sess.execute(select(AppMetadataModel).where(AppMetadataModel.id == app_id))
+                meta = result.scalars().first()
+                if meta and meta.extra and meta.extra.get("s3_bucket"):
+                    return meta.extra["s3_bucket"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch bucket for app %s: %s", app_id, exc)
+        return None
+
+    async def _upload_to_app_bucket(
+        self,
+        auth: AuthContext,
+        content_base64: str,
+        key: str,
+        content_type: Optional[str] = None,
+    ) -> tuple[str, str]:
+        bucket_override = await self._get_bucket_for_app(auth.app_id)
+        return await self.storage.upload_from_base64(content_base64, key, content_type, bucket=bucket_override or "")

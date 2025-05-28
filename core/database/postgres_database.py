@@ -3,12 +3,14 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Column, Index, String, select, text
+from sqlalchemy import Column, Index, String, and_, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from ..models.auth import AuthContext
+from core.config import get_settings
+
+from ..models.auth import AuthContext, EntityType
 from ..models.documents import Document, StorageFileInfo
 from ..models.folders import Folder
 from ..models.graph import Graph
@@ -40,6 +42,12 @@ class DocumentModel(Base):
         Index("idx_owner_id", "owner", postgresql_using="gin"),
         Index("idx_access_control", "access_control", postgresql_using="gin"),
         Index("idx_system_metadata", "system_metadata", postgresql_using="gin"),
+        Index("idx_doc_metadata_gin", "doc_metadata", postgresql_using="gin"),
+        Index("idx_doc_owner_text_id", text("(owner->>'id')")),
+        Index("idx_doc_system_metadata_app_id", text("(system_metadata->>'app_id')")),
+        Index("idx_doc_access_control_user_id", text("(access_control->>'user_id')")),
+        Index("idx_doc_system_metadata_folder_name", text("(system_metadata->>'folder_name')")),
+        Index("idx_doc_system_metadata_end_user_id", text("(system_metadata->>'end_user_id')")),
     )
 
 
@@ -91,6 +99,27 @@ class FolderModel(Base):
         Index("idx_folder_name", "name"),
         Index("idx_folder_owner", "owner", postgresql_using="gin"),
         Index("idx_folder_access_control", "access_control", postgresql_using="gin"),
+        # Index to filter folders by app_id in system_metadata
+        Index("idx_folder_system_metadata_app_id", text("(system_metadata->>'app_id')")),
+    )
+
+
+class ChatConversationModel(Base):
+    """SQLAlchemy model for persisted chat history."""
+
+    __tablename__ = "chat_conversations"
+
+    conversation_id = Column(String, primary_key=True)
+    user_id = Column(String, index=True, nullable=True)
+    app_id = Column(String, index=True, nullable=True)
+    history = Column(JSONB, default=list)
+    created_at = Column(String)
+    updated_at = Column(String)
+
+    __table_args__ = (
+        Index("idx_chat_user_id", "user_id"),
+        Index("idx_chat_app_id", "app_id"),
+        Index("idx_chat_conversation_id", "conversation_id"),
     )
 
 
@@ -108,14 +137,36 @@ def _serialize_datetime(obj: Any) -> Any:
 class PostgresDatabase(BaseDatabase):
     """PostgreSQL implementation for document metadata storage."""
 
+    async def delete_folder(self, folder_id: str, auth: AuthContext) -> bool:
+        """Delete a folder row if user has admin access."""
+        try:
+            # Fetch the folder to check permissions
+            folder = await self.get_folder(folder_id, auth)
+            if not folder:
+                logger.error(f"Folder {folder_id} not found or user does not have access")
+                return False
+            if not self._check_folder_access(folder, auth, "admin"):
+                logger.error(f"User does not have admin access to folder {folder_id}")
+                return False
+            async with self.async_session() as session:
+                folder_model = await session.get(FolderModel, folder_id)
+                if not folder_model:
+                    logger.error(f"Folder {folder_id} not found in database")
+                    return False
+                await session.delete(folder_model)
+                await session.commit()
+                logger.info(f"Deleted folder {folder_id}")
+                return True
+        except Exception as e:
+            logger.error(f"Error deleting folder: {e}")
+            return False
+
     def __init__(
         self,
         uri: str,
     ):
         """Initialize PostgreSQL connection for document storage."""
         # Load settings from config
-        from core.config import get_settings
-
         settings = get_settings()
 
         # Get database pool settings from config with defaults
@@ -200,16 +251,6 @@ class PostgresDatabase(BaseDatabase):
                     )
                     logger.info("Added storage_files column to documents table")
 
-                # Create indexes for folder_name and end_user_id in system_metadata for documents
-                await conn.execute(
-                    text(
-                        """
-                    CREATE INDEX IF NOT EXISTS idx_system_metadata_folder_name
-                    ON documents ((system_metadata->>'folder_name'));
-                    """
-                    )
-                )
-
                 # Create folders table if it doesn't exist
                 await conn.execute(
                     text(
@@ -256,15 +297,6 @@ class PostgresDatabase(BaseDatabase):
                     text("CREATE INDEX IF NOT EXISTS idx_folder_access_control ON folders USING gin (access_control);")
                 )
 
-                await conn.execute(
-                    text(
-                        """
-                    CREATE INDEX IF NOT EXISTS idx_system_metadata_end_user_id
-                    ON documents ((system_metadata->>'end_user_id'));
-                    """
-                    )
-                )
-
                 # Check if system_metadata column exists in graphs table
                 result = await conn.execute(
                     text(
@@ -306,7 +338,17 @@ class PostgresDatabase(BaseDatabase):
                     )
                 )
 
-                logger.info("Created indexes for folder_name and end_user_id in system_metadata")
+                # Create index for app_id in system_metadata for graphs to optimize developer-scoped queries
+                await conn.execute(
+                    text(
+                        """
+                    CREATE INDEX IF NOT EXISTS idx_graph_system_metadata_app_id
+                    ON graphs ((system_metadata->>'app_id'));
+                    """
+                    )
+                )
+
+                logger.info("Created indexes for folder_name, end_user_id, and app_id in system_metadata")
 
             logger.info("PostgreSQL tables and indexes created successfully")
             self._initialized = True
@@ -754,27 +796,36 @@ class PostgresDatabase(BaseDatabase):
             return False
 
     def _build_access_filter(self, auth: AuthContext) -> str:
-        """Build PostgreSQL filter for access control."""
-        filters = [
-            f"owner->>'id' = '{auth.entity_id}'",
+        """Build PostgreSQL filter for access control.
+
+        For developer-scoped tokens (i.e. those that include an ``app_id``) we *must* ensure
+        that the caller only ever sees documents that belong to that application.  Simply
+        checking the developer entity ID is **insufficient**, because multiple apps created
+        by the same developer share the same entity ID.  Therefore, when an ``app_id`` is
+        present, we additionally scope the filter by the ``app_id`` that is stored either
+        in ``system_metadata.app_id`` or in the ``access_control->app_access`` list.
+        """
+
+        # Base clauses that will always be AND-ed with any additional application scoping.
+        base_clauses = [
+            f'owner @> \'{{"id": "{auth.entity_id}"}}\'::jsonb',  # Check owner using @>
             f"access_control->'readers' ? '{auth.entity_id}'",
             f"access_control->'writers' ? '{auth.entity_id}'",
             f"access_control->'admins' ? '{auth.entity_id}'",
         ]
 
-        if auth.entity_type == "DEVELOPER" and auth.app_id:
-            # Add app-specific access for developers
-            filters.append(f"access_control->'app_access' ? '{auth.app_id}'")
+        # Developer token with app_id → restrict strictly by that app_id.
+        if auth.entity_type == EntityType.DEVELOPER and auth.app_id:
+            filters = [f'system_metadata @> \'{{"app_id": "{auth.app_id}"}}\'::jsonb']  # Check app_id using @>
+        else:
+            filters = base_clauses.copy()
 
-        # Add user_id filter in cloud mode
+        # In cloud mode further restrict by user_id when available (used for multi-tenant
+        # end-user isolation).
         if auth.user_id:
-            from core.config import get_settings
-
-            settings = get_settings()
-
-            if settings.MODE == "cloud":
-                # Filter by user_id in access_control
-                filters.append(f"access_control->>'user_id' = '{auth.user_id}'")
+            if get_settings().MODE == "cloud":
+                # access_control.user_id is a list in the DocumentModel, so `?` is correct and uses the GIN index.
+                filters.append(f"access_control->'user_id' ? '{auth.user_id}'")
 
         return " OR ".join(filters)
 
@@ -790,78 +841,72 @@ class PostgresDatabase(BaseDatabase):
                 if not value:  # Skip empty lists
                     continue
 
-                # Build a list of properly escaped values
-                escaped_values = []
-                for item in value:
-                    if isinstance(item, bool):
-                        escaped_values.append(str(item).lower())
-                    elif isinstance(item, str):
-                        # Use standard replace, avoid complex f-string quoting for black
-                        escaped_value = item.replace("'", "''")
-                        escaped_values.append(f"'{escaped_value}'")
-                    else:
-                        escaped_values.append(f"'{item}'")
+                # New approach for lists: OR together multiple @> conditions
+                # This allows each item in the list to be checked for containment.
+                or_clauses_for_list = []
+                for item_in_list in value:
+                    json_filter_object = {key: item_in_list}
+                    json_string_for_sql = json.dumps(json_filter_object)
+                    sql_escaped_json_string = json_string_for_sql.replace("'", "''")
+                    or_clauses_for_list.append(f"doc_metadata @> '{sql_escaped_json_string}'::jsonb")
+                if or_clauses_for_list:
+                    filter_conditions.append(f"({' OR '.join(or_clauses_for_list)})")
 
-                # Join with commas for IN clause
-                values_str = ", ".join(escaped_values)
-                filter_conditions.append(f"doc_metadata->>'{key}' IN ({values_str})")
             else:
                 # Handle single value (equality)
-                # Convert boolean values to string 'true' or 'false'
-                if isinstance(value, bool):
-                    value = str(value).lower()
-
-                # Use proper SQL escaping for string values
-                if isinstance(value, str):
-                    # Replace single quotes with double single quotes to escape them
-                    value = value.replace("'", "''")
-
-                filter_conditions.append(f"doc_metadata->>'{key}' = '{value}'")
+                # New approach for single value: Use JSONB containment operator @>
+                json_filter_object = {key: value}
+                json_string_for_sql = json.dumps(json_filter_object)
+                sql_escaped_json_string = json_string_for_sql.replace("'", "''")
+                filter_conditions.append(f"doc_metadata @> '{sql_escaped_json_string}'::jsonb")
 
         return " AND ".join(filter_conditions)
 
     def _build_system_metadata_filter(self, system_filters: Optional[Dict[str, Any]]) -> str:
-        """Build PostgreSQL filter for system metadata."""
+        """Build PostgreSQL filter for system metadata.
+
+        This helper supports two storage patterns for JSONB values:
+        1. Scalar values – e.g. ``{"folder_name": "folder1"}``
+        2. Array values  – e.g. ``{"folder_name": ["folder1", "folder2"]}``
+
+        For robust folder / end-user scoping we need to correctly match either
+        pattern.  Therefore for every supplied *value* we generate a predicate
+        that checks **either** a scalar equality **or** membership of the value
+        in a JSON array using the `?` operator.  Multiple values for the same
+        key are OR-ed together, while predicates for different keys are AND-ed.
+        """
         if not system_filters:
             return ""
 
-        conditions = []
+        key_clauses: List[str] = []
+
         for key, value in system_filters.items():
             if value is None:
                 continue
 
-            # Handle list of values (IN operator)
-            if isinstance(value, list):
-                if not value:  # Skip empty lists
-                    continue
+            # Normalise to a list for uniform processing.
+            values = value if isinstance(value, list) else [value]
+            if not values:
+                continue
 
-                # Build a list of properly escaped values
-                escaped_values = []
-                for item in value:
-                    if isinstance(item, bool):
-                        escaped_values.append(str(item).lower())
-                    elif isinstance(item, str):
-                        # Use standard replace, avoid complex f-string quoting for black
-                        escaped_value = item.replace("'", "''")
-                        escaped_values.append(f"'{escaped_value}'")
-                    else:
-                        escaped_values.append(f"'{item}'")
+            value_clauses = []
+            for item in values:
+                # New approach: Use JSONB containment operator @>
+                # This allows matching native JSON types (boolean, number, string)
+                # and leverages the GIN index on the system_metadata column.
+                json_filter_object = {key: item}
+                # json.dumps will correctly format item as a JSON string, number, or boolean
+                json_string_for_sql = json.dumps(json_filter_object)
+                # Escape single quotes within the generated JSON string for SQL literal
+                sql_escaped_json_string = json_string_for_sql.replace("'", "''")
 
-                # Join with commas for IN clause
-                values_str = ", ".join(escaped_values)
-                conditions.append(f"system_metadata->>'{key}' IN ({values_str})")
-            else:
-                # Handle single value (equality)
-                if isinstance(value, str):
-                    # Replace single quotes with double single quotes to escape them
-                    escaped_value = value.replace("'", "''")
-                    conditions.append(f"system_metadata->>'{key}' = '{escaped_value}'")
-                elif isinstance(value, bool):
-                    conditions.append(f"system_metadata->>'{key}' = '{str(value).lower()}'")
-                else:
-                    conditions.append(f"system_metadata->>'{key}' = '{value}'")
+                value_clauses.append(f"system_metadata @> '{sql_escaped_json_string}'::jsonb")
 
-        return " AND ".join(conditions)
+            # OR all alternative values for this key, wrap in parentheses.
+            key_clauses.append("(" + " OR ".join(value_clauses) + ")")
+
+        # AND across different keys
+        return " AND ".join(key_clauses)
 
     async def store_cache_metadata(self, name: str, metadata: Dict[str, Any]) -> bool:
         """Store metadata for a cache in PostgreSQL.
@@ -1186,16 +1231,21 @@ class PostgresDatabase(BaseDatabase):
                 # Convert datetime objects to strings for JSON serialization
                 folder_dict = _serialize_datetime(folder_dict)
 
-                # Check if a folder with this name already exists for this owner
-                # Use only the type/id format
-                stmt = text(
-                    """
+                # Check if a folder with this name already exists for this owner, scoped by app_id (if present)
+                app_id_val = folder_dict.get("system_metadata", {}).get("app_id")
+                params = {"name": folder.name, "entity_id": folder.owner["id"], "entity_type": folder.owner["type"]}
+                sql = """
                     SELECT id FROM folders
                     WHERE name = :name
                     AND owner->>'id' = :entity_id
                     AND owner->>'type' = :entity_type
                     """
-                ).bindparams(name=folder.name, entity_id=folder.owner["id"], entity_type=folder.owner["type"])
+                if app_id_val is not None:
+                    sql += """
+                    AND system_metadata->>'app_id' = :app_id
+                    """
+                    params["app_id"] = app_id_val
+                stmt = text(sql).bindparams(**params)
 
                 result = await session.execute(stmt)
                 existing_folder = result.scalar_one_or_none()
@@ -1307,7 +1357,12 @@ class PostgresDatabase(BaseDatabase):
                             "rules": folder_row.rules,
                         }
 
-                        return Folder(**folder_dict)
+                        folder = Folder(**folder_dict)
+                        # Enforce app_id scoping
+                        if self._check_folder_access(folder, auth, "read"):
+                            return folder
+                        else:
+                            return None
 
                 # If not found, try to find any accessible folder with that name
                 stmt = text(
@@ -1345,7 +1400,12 @@ class PostgresDatabase(BaseDatabase):
                         "rules": folder_row.rules,
                     }
 
-                    return Folder(**folder_dict)
+                    folder = Folder(**folder_dict)
+                    # Enforce app_id scoping
+                    if self._check_folder_access(folder, auth, "read"):
+                        return folder
+                    else:
+                        return None
 
                 return None
 
@@ -1354,17 +1414,70 @@ class PostgresDatabase(BaseDatabase):
             return None
 
     async def list_folders(self, auth: AuthContext) -> List[Folder]:
-        """List all folders the user has access to."""
+        """List all folders the user has access to by building a dynamic SQL query."""
         try:
-            folders = []
+            where_filters = []  # For top-level AND conditions (e.g., app_id)
+            core_access_conditions = []  # For OR conditions (owner, reader_acl, admin_acl)
+            current_params = {}
 
-            async with self.async_session() as session:
-                # Get all folders
-                result = await session.execute(select(FolderModel))
+            # 1. Developer App ID Scoping (always applied as an AND condition if auth context specifies it)
+            if auth.entity_type == EntityType.DEVELOPER and auth.app_id:
+                where_filters.append(text("system_metadata->>'app_id' = :app_id_val"))
+                current_params["app_id_val"] = auth.app_id
+
+            # 2. Build Core Access Conditions (Owner, Reader ACL, Admin ACL)
+            # These are OR'd together. The user must satisfy one of these, AND the app_id scope if applicable.
+
+            # Condition 2a: User is the owner of the folder
+            if auth.entity_type and auth.entity_id:
+                owner_sub_conditions_text = []
+
+                owner_sub_conditions_text.append("owner->>'type' = :owner_type_val")
+                current_params["owner_type_val"] = auth.entity_type.value
+
+                owner_sub_conditions_text.append("owner->>'id' = :owner_id_val")
+                current_params["owner_id_val"] = auth.entity_id
+
+                if auth.user_id and get_settings().MODE == "cloud":
+                    owner_sub_conditions_text.append("access_control->'user_id' ? :owner_user_id_val")
+                    current_params["owner_user_id_val"] = auth.user_id
+
+                # Combine owner sub-conditions with AND
+                core_access_conditions.append(text(f"({' AND '.join(owner_sub_conditions_text)})"))
+
+            # Condition 2b & 2c: User is in the folder's 'readers' or 'admins' access control list
+            if auth.entity_type and auth.entity_id:
+                entity_qualifier_for_acl = f"{auth.entity_type.value}:{auth.entity_id}"
+                current_params["acl_qualifier"] = entity_qualifier_for_acl  # Used for both readers and admins
+
+                core_access_conditions.append(text("access_control->'readers' ? :acl_qualifier"))
+                core_access_conditions.append(
+                    text("access_control->'admins' ? :acl_qualifier")
+                )  # Added folder admins ACL check
+
+            # Combine core access conditions with OR, and add this group to the main AND filters
+            if core_access_conditions:
+                where_filters.append(or_(*core_access_conditions))
+            else:
+                # If there are no core ways to grant access (e.g., anonymous user without entity_id/type),
+                # this effectively means this part of the condition is false.
+                where_filters.append(text("1=0"))  # Effectively False if no ownership or ACL grant possible
+
+            # Build and execute query
+            async with self.async_session() as session:  # Ensure session is correctly established
+                query = select(FolderModel)
+                if where_filters:
+                    # If any filters were constructed
+                    query = query.where(and_(*where_filters))
+                else:
+                    # To be absolutely safe: if no filters ended up in where_filters, deny all access.
+                    query = query.where(text("1=0"))  # Default to no access if no filters constructed
+
+                result = await session.execute(query, current_params)
                 folder_models = result.scalars().all()
 
+                folders = []
                 for folder_model in folder_models:
-                    # Convert to Folder object
                     folder_dict = {
                         "id": folder_model.id,
                         "name": folder_model.name,
@@ -1375,13 +1488,7 @@ class PostgresDatabase(BaseDatabase):
                         "access_control": folder_model.access_control,
                         "rules": folder_model.rules,
                     }
-
-                    folder = Folder(**folder_dict)
-
-                    # Check if the user has access to the folder
-                    if self._check_folder_access(folder, auth, "read"):
-                        folders.append(folder)
-
+                    folders.append(Folder(**folder_dict))
                 return folders
 
         except Exception as e:
@@ -1495,8 +1602,128 @@ class PostgresDatabase(BaseDatabase):
             logger.error(f"Error removing document from folder: {e}")
             return False
 
+    async def get_chat_history(
+        self, conversation_id: str, user_id: Optional[str], app_id: Optional[str]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return stored chat history for *conversation_id*."""
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(
+                    select(ChatConversationModel).where(ChatConversationModel.conversation_id == conversation_id)
+                )
+                convo = result.scalar_one_or_none()
+                if not convo:
+                    return None
+                if user_id and convo.user_id and convo.user_id != user_id:
+                    return None
+                if app_id and convo.app_id and convo.app_id != app_id:
+                    return None
+                return convo.history
+        except Exception as e:
+            logger.error(f"Error getting chat history: {e}")
+            return None
+
+    async def upsert_chat_history(
+        self,
+        conversation_id: str,
+        user_id: Optional[str],
+        app_id: Optional[str],
+        history: List[Dict[str, Any]],
+    ) -> bool:
+        """Store or update chat history."""
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            now = datetime.now(UTC).isoformat()
+            async with self.async_session() as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO chat_conversations (conversation_id, user_id, app_id, history, created_at, updated_at)
+                        VALUES (:cid, :uid, :aid, :hist, :now, :now)
+                        ON CONFLICT (conversation_id)
+                        DO UPDATE SET
+                            user_id = EXCLUDED.user_id,
+                            app_id = EXCLUDED.app_id,
+                            history = EXCLUDED.history,
+                            updated_at = :now
+                        """
+                    ),
+                    {
+                        "cid": conversation_id,
+                        "uid": user_id,
+                        "aid": app_id,
+                        "hist": json.dumps(history),
+                        "now": now,
+                    },
+                )
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error upserting chat history: {e}")
+            return False
+
+    async def list_chat_conversations(
+        self,
+        user_id: Optional[str],
+        app_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return chat conversations for a given user (and optional app) ordered by last update.
+
+        Args:
+            user_id: ID of the user that owns the conversation (required for cloud-mode privacy).
+            app_id: Optional application scope for developer tokens.
+            limit: Maximum number of conversations to return.
+
+        Returns:
+            A list of dictionaries containing conversation_id, updated_at and a preview of the
+            last message (if available).
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            async with self.async_session() as session:
+                stmt = select(ChatConversationModel).order_by(ChatConversationModel.updated_at.desc())
+
+                if user_id is not None:
+                    stmt = stmt.where(ChatConversationModel.user_id == user_id)
+                # When an app_id scope is specified (developer tokens) we must restrict results
+                if app_id is not None:
+                    stmt = stmt.where(ChatConversationModel.app_id == app_id)
+
+                stmt = stmt.limit(limit)
+                res = await session.execute(stmt)
+                convos = res.scalars().all()
+
+                conversations: List[Dict[str, Any]] = []
+                for convo in convos:
+                    last_message = convo.history[-1] if convo.history else None
+                    conversations.append(
+                        {
+                            "chat_id": convo.conversation_id,
+                            "updated_at": convo.updated_at,
+                            "created_at": convo.created_at,
+                            "last_message": last_message,
+                        }
+                    )
+                return conversations
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error listing chat conversations: %s", exc)
+            return []
+
     def _check_folder_access(self, folder: Folder, auth: AuthContext, permission: str = "read") -> bool:
         """Check if the user has the required permission for the folder."""
+        # Developer-scoped tokens: restrict by app_id on folders
+        if auth.entity_type == EntityType.DEVELOPER and auth.app_id:
+            if folder.system_metadata.get("app_id") != auth.app_id:
+                return False
+
         # Admin always has access
         if "admin" in auth.permissions:
             return True
@@ -1511,11 +1738,8 @@ class PostgresDatabase(BaseDatabase):
 
             # In cloud mode, also verify user_id if present
             if auth.user_id:
-                from core.config import get_settings
-
-                settings = get_settings()
-
-                if settings.MODE == "cloud":
+                if get_settings().MODE == "cloud":  # Call get_settings() directly
+                    # Assuming access_control.user_id is a list of user IDs
                     folder_user_ids = folder.access_control.get("user_id", [])
                     if auth.user_id not in folder_user_ids:
                         return False
@@ -1523,21 +1747,23 @@ class PostgresDatabase(BaseDatabase):
 
         # Check access control lists
         access_control = folder.access_control or {}
+        # ACLs for folders store entries as "entity_type_value:entity_id"
+        entity_qualifier = f"{auth.entity_type.value}:{auth.entity_id}"
 
         if permission == "read":
             readers = access_control.get("readers", [])
-            if f"{auth.entity_type.value}:{auth.entity_id}" in readers:
+            if entity_qualifier in readers:
                 return True
 
         if permission == "write":
             writers = access_control.get("writers", [])
-            if f"{auth.entity_type.value}:{auth.entity_id}" in writers:
+            if entity_qualifier in writers:
                 return True
 
         # For admin permission, check admins list
-        if permission == "admin":
+        if permission == "admin":  # This check is for folder-level admin, not global admin
             admins = access_control.get("admins", [])
-            if f"{auth.entity_type.value}:{auth.entity_id}" in admins:
+            if entity_qualifier in admins:
                 return True
 
         return False

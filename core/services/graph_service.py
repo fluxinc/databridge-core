@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 from pydantic import BaseModel
@@ -66,6 +66,7 @@ class GraphService:
         additional_documents: Optional[List[str]] = None,
         prompt_overrides: Optional[GraphPromptOverrides] = None,
         system_filters: Optional[Dict[str, Any]] = None,
+        is_initial_build: bool = False,
     ) -> Graph:
         """Update an existing graph with new documents.
 
@@ -81,6 +82,7 @@ class GraphService:
             prompt_overrides: Optional GraphPromptOverrides with customizations for prompts
             system_filters: Optional system metadata filters (e.g. folder_name, end_user_id)
             to determine which documents to include
+            is_initial_build: Whether this is the initial build of the graph
 
         Returns:
             Graph: The updated graph
@@ -97,6 +99,17 @@ class GraphService:
         if not existing_graph:
             raise ValueError(f"Graph '{name}' not found")
 
+        # Check if the graph is currently being processed by another operation
+        if existing_graph.system_metadata.get("status") == "processing" and not is_initial_build:
+            raise ValueError(
+                f"Graph '{name}' is currently being processed and cannot be updated yet. "
+                f"Please wait for the creation process to complete."
+            )
+
+        # Ensure app_id scoping: persist app_id into system_metadata if this is a developer-scoped token
+        if auth.app_id and existing_graph.system_metadata.get("app_id") != auth.app_id:
+            existing_graph.system_metadata["app_id"] = auth.app_id
+
         # Track explicitly added documents to ensure they're included in the final graph
         # even if they don't have new entities or relationships
         explicit_doc_ids = set(additional_documents or [])
@@ -108,6 +121,8 @@ class GraphService:
 
         if not document_ids and not explicit_doc_ids:
             # No new documents to add
+            existing_graph.system_metadata["status"] = "completed"
+            await self.db.update_graph(existing_graph)
             return existing_graph
 
         # Create a set for all document IDs that should be included in the updated graph
@@ -182,6 +197,9 @@ class GraphService:
             additional_filters,
             additional_doc_ids,
         )
+
+        # NEW: mark graph as completed after processing
+        existing_graph.system_metadata["status"] = "completed"
 
         # Store the updated graph in the database
         if not await self.db.update_graph(existing_graph):
@@ -475,6 +493,10 @@ class GraphService:
             if "end_user_id" in system_filters:
                 graph.system_metadata["end_user_id"] = system_filters["end_user_id"]
 
+        # NEW: Add app_id to system_metadata when operating under a developer-scoped token
+        if auth.app_id:
+            graph.system_metadata["app_id"] = auth.app_id
+
         # Extract entities and relationships
         entities, relationships = await self._process_documents_for_entities(
             document_objects, auth, document_service, prompt_overrides
@@ -483,6 +505,9 @@ class GraphService:
         # Add entities and relationships to the graph
         graph.entities = list(entities.values())
         graph.relationships = relationships
+
+        # NEW: Mark completion status
+        graph.system_metadata["status"] = "completed"
 
         # Store the graph in the database
         if not await self.db.store_graph(graph):
@@ -899,7 +924,7 @@ class GraphService:
         hop_depth: int = 1,
         include_paths: bool = False,
         prompt_overrides: Optional[QueryPromptOverrides] = None,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
     ) -> CompletionResponse:
         """Generate completion using knowledge graph-enhanced retrieval.
@@ -1180,7 +1205,7 @@ class GraphService:
         auth: AuthContext,
         filters: Optional[Dict[str, Any]],
         document_service,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
     ) -> List[ChunkResult]:
         """Retrieve chunks containing the specified entities."""
@@ -1358,7 +1383,7 @@ class GraphService:
         auth: Optional[AuthContext] = None,
         graph_name: Optional[str] = None,
         prompt_overrides: Optional[QueryPromptOverrides] = None,
-        folder_name: Optional[str] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
         end_user_id: Optional[str] = None,
     ) -> CompletionResponse:
         """Generate completion using the retrieved chunks and optional path information."""

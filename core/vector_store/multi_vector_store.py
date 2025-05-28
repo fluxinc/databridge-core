@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from contextlib import contextmanager
@@ -223,50 +224,42 @@ class MultiVectorStore(BaseVectorStore):
 
     async def store_embeddings(self, chunks: List[DocumentChunk]) -> Tuple[bool, List[str]]:
         """Store document chunks with their multi-vector embeddings."""
-        # try:
-        if not chunks:
+        # Prepare a list of row tuples for executemany
+        rows = []
+        for chunk in chunks:
+            if not hasattr(chunk, "embedding") or chunk.embedding is None:
+                logger.error(f"Missing embeddings for chunk {chunk.document_id}-{chunk.chunk_number}")
+                continue
+
+            binary_embeddings = self._binary_quantize(chunk.embedding)
+
+            rows.append(
+                (
+                    chunk.document_id,
+                    chunk.chunk_number,
+                    chunk.content,
+                    str(chunk.metadata),
+                    binary_embeddings,
+                )
+            )
+
+        if not rows:
             return True, []
 
-        stored_ids = []
         with self.get_connection() as conn:
-            for chunk in chunks:
-                # Ensure embeddings exist
-                if not hasattr(chunk, "embedding") or chunk.embedding is None:
-                    logger.error(f"Missing embeddings for chunk {chunk.document_id}-{chunk.chunk_number}")
-                    continue
-
-                # For multi-vector embeddings, we expect a list of vectors
-                embeddings = chunk.embedding
-
-                # Create binary representation for each vector
-                binary_embeddings = self._binary_quantize(embeddings)
-
-                # Insert into database with retry logic
-
-                conn.execute(
+            with conn.cursor() as cur:
+                cur.executemany(
                     """
                     INSERT INTO multi_vector_embeddings
                     (document_id, chunk_number, content, chunk_metadata, embeddings)
                     VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (
-                        chunk.document_id,
-                        chunk.chunk_number,
-                        chunk.content,
-                        str(chunk.metadata),
-                        binary_embeddings,
-                    ),
+                    rows,
                 )
 
-                stored_ids.append(f"{chunk.document_id}-{chunk.chunk_number}")
-
-        logger.debug(f"{len(stored_ids)} vector embeddings added successfully!")
-        return len(stored_ids) > 0, stored_ids
-
-        # except Exception as e:
-        #     logger.error(f"Error storing multi-vector embeddings: {str(e)}")
-        #     raise e
-        #     return False, []
+        stored_ids = [f"{r[0]}-{r[1]}" for r in rows]
+        logger.debug(f"{len(stored_ids)} multi-vector embeddings added in bulk")
+        return True, stored_ids
 
     async def query_similar(
         self,
@@ -308,8 +301,8 @@ class MultiVectorStore(BaseVectorStore):
         chunks = []
         for row in result:
             try:
-                metadata = eval(row[4]) if row[4] else {}
-            except (ValueError, SyntaxError):
+                metadata = json.loads(row[4]) if row[4] else {}
+            except Exception:
                 metadata = {}
 
             chunk = DocumentChunk(
@@ -369,8 +362,8 @@ class MultiVectorStore(BaseVectorStore):
         chunks = []
         for row in result:
             try:
-                metadata = eval(row[3]) if row[3] else {}
-            except (ValueError, SyntaxError):
+                metadata = json.loads(row[3]) if row[3] else {}
+            except Exception:
                 metadata = {}
 
             chunk = DocumentChunk(

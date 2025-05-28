@@ -20,7 +20,10 @@ class RetrieveRequest(BaseModel):
     )
     hop_depth: Optional[int] = Field(1, description="Number of relationship hops to traverse in the graph", ge=1, le=3)
     include_paths: Optional[bool] = Field(False, description="Whether to include relationship paths in the response")
-    folder_name: Optional[str] = Field(None, description="Optional folder scope for the operation")
+    folder_name: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Optional folder scope for the operation. Accepts a single folder name or a list of folder names.",
+    )
     end_user_id: Optional[str] = Field(None, description="Optional end-user scope for the operation")
 
 
@@ -36,6 +39,10 @@ class CompletionQueryRequest(RetrieveRequest):
     schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = Field(
         None,
         description="Schema for structured output, can be a Pydantic model or JSON schema dict",
+    )
+    chat_id: Optional[str] = Field(
+        None,
+        description="Optional chat session ID for persisting conversation history",
     )
 
 
@@ -71,7 +78,10 @@ class CreateGraphRequest(BaseModel):
             }
         },
     )
-    folder_name: Optional[str] = Field(None, description="Optional folder scope for the operation")
+    folder_name: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Optional folder scope for the operation. Accepts a single folder name or a list of folder names.",
+    )
     end_user_id: Optional[str] = Field(None, description="Optional end-user scope for the operation")
 
 
@@ -88,7 +98,10 @@ class UpdateGraphRequest(BaseModel):
     prompt_overrides: Optional[GraphPromptOverrides] = Field(
         None, description="Optional customizations for entity extraction and resolution prompts"
     )
-    folder_name: Optional[str] = Field(None, description="Optional folder scope for the operation")
+    folder_name: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Optional folder scope for the operation. Accepts a single folder name or a list of folder names.",
+    )
     end_user_id: Optional[str] = Field(None, description="Optional end-user scope for the operation")
 
 
@@ -128,3 +141,9 @@ class SetFolderRuleRequest(BaseModel):
     """Request model for setting folder rules"""
 
     rules: List[MetadataExtractionRuleRequest]
+
+
+class AgentQueryRequest(BaseModel):
+    """Request model for agent queries"""
+
+    query: str = Field(..., description="Natural language query for the Morphik agent")

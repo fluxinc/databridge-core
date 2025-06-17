@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
     ASSEMBLYAI_API_KEY: Optional[str] = None
+    HUGGING_FACE_TOKEN: Optional[str] = None
 
     # API configuration
     HOST: str
@@ -235,6 +236,11 @@ def get_settings() -> Settings:
         raise ValueError("'model' is required in the embedding configuration")
     embedding_config["EMBEDDING_MODEL"] = config["embedding"]["model"]
 
+    # load huggingface config
+    huggingface_config = {}
+    if "HUGGING_FACE_TOKEN" in os.environ:
+        huggingface_config["HUGGING_FACE_TOKEN"] = os.environ["HUGGING_FACE_TOKEN"]
+
     # load parser config
     parser_config = {
         "CHUNK_SIZE": config["parser"]["chunk_size"],
@@ -376,6 +382,7 @@ def get_settings() -> Settings:
             agent_config,
             database_config,
             embedding_config,
+            huggingface_config,
             parser_config,
             reranker_config,
             storage_config,

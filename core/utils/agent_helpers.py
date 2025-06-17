@@ -71,7 +71,7 @@ def process_single_image(client: genai.Client, base64_image: str, description: s
 
     logger.info(f"Gemini bounding box prompt: {prompt}")
 
-    response = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt, image])
+    response = client.models.generate_content(model="gemini-2.5-flash-preview-05-20", contents=[prompt, image])
 
     logger.info(f"Gemini bounding box response: {response.text}")
     json_output = parse_json(response.text)

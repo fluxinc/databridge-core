@@ -208,5 +208,27 @@
         },
         "required": []
       }
+    },
+    {
+      "name": "graph_api_retrieve",
+      "description": "Retrieves information from a remote Morphik knowledge graph (GRAPH_MODE=api). Use this when the knowledge graph is managed by the Morphik cloud service instead of the local graph engine. The tool sends the natural-language question to the remote graph and returns the answer string produced by the service.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The question to ask the knowledge graph"
+          },
+          "graph_name": {
+            "type": ["string", "null"],
+            "description": "Optional graph name. If omitted, the assistant will pick \"graph_main\" or the only available graph."
+          },
+          "end_user_id": {
+            "type": ["string", "null"],
+            "description": "Optional end-user ID to scope the query"
+          }
+        },
+        "required": ["query"]
+      }
     }
 ]

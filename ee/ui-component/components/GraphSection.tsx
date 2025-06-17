@@ -21,9 +21,16 @@ import { AlertCircle, Share2, Plus, Network, Tag, Link, ArrowLeft } from "lucide
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
+import { showAlert } from "@/components/ui/alert-system";
+import { MultiSelect } from "@/components/ui/multi-select";
 
 // Dynamically import ForceGraphComponent to avoid SSR issues
 const ForceGraphComponent = dynamic(() => import("@/components/ForceGraphComponent"), {
+  ssr: false,
+});
+
+// Import the NodeDetailsSidebar component
+const NodeDetailsSidebar = dynamic(() => import("@/components/NodeDetailsSidebar"), {
   ssr: false,
 });
 
@@ -40,8 +47,16 @@ interface Graph {
   updated_at: string;
   system_metadata?: {
     status?: string;
+    workflow_id?: string;
+    run_id?: string;
     [key: string]: unknown;
   };
+}
+
+interface WorkflowStatusResponse {
+  status: "running" | "completed" | "failed";
+  result?: Record<string, unknown>;
+  error?: string;
 }
 
 interface Entity {
@@ -57,6 +72,20 @@ interface Relationship {
   type: string;
   source_id: string;
   target_id: string;
+}
+
+interface NodeObject {
+  id: string;
+  label: string;
+  type: string;
+  properties: Record<string, unknown>;
+  color: string;
+}
+
+interface LinkObject {
+  source: string;
+  target: string;
+  type: string;
 }
 
 interface GraphSectionProps {
@@ -80,6 +109,14 @@ const entityTypeColors: Record<string, string> = {
 };
 
 const POLL_INTERVAL_MS = 60000; // 1 minute
+
+// Interface for document API response
+interface ApiDocumentResponse {
+  external_id?: string;
+  id?: string;
+  filename?: string;
+  name?: string;
+}
 
 const GraphSection: React.FC<GraphSectionProps> = ({
   apiBaseUrl,
@@ -121,13 +158,21 @@ const GraphSection: React.FC<GraphSectionProps> = ({
   const [showLinkLabels, setShowLinkLabels] = useState(true);
   const [showVisualization, setShowVisualization] = useState(false);
   const [graphDimensions, setGraphDimensions] = useState({ width: 0, height: 0 });
+  const [graphData, setGraphData] = useState<{ nodes: NodeObject[]; links: LinkObject[] }>({ nodes: [], links: [] });
+  const [loadingVisualization, setLoadingVisualization] = useState(false);
+  const [selectedNode, setSelectedNode] = useState<NodeObject | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Document selection state
+  const [documents, setDocuments] = useState<{ id: string; filename: string }[]>([]);
+  const [loadingDocuments, setLoadingDocuments] = useState(false);
 
   // Refs for graph visualization
   const graphContainerRef = useRef<HTMLDivElement>(null);
   // Removed graphInstance ref as it's not needed with the dynamic component
 
-  // Prepare data for force-graph
-  const prepareGraphData = useCallback((graph: Graph | null) => {
+  // Fallback function for local graph data (when API fails or for local graphs)
+  const prepareLocalGraphData = useCallback((graph: Graph | null) => {
     if (!graph) return { nodes: [], links: [] };
 
     const nodes = graph.entities.map(entity => ({
@@ -153,7 +198,57 @@ const GraphSection: React.FC<GraphSectionProps> = ({
     return { nodes, links };
   }, []);
 
-  // Removed initializeGraph function as it's no longer needed
+  // Prepare data for force-graph
+  const prepareGraphData = useCallback(
+    async (graph: Graph | null) => {
+      if (!graph) return { nodes: [], links: [] };
+
+      try {
+        // Fetch visualization data from the API
+        const headers = createHeaders();
+        const response = await fetch(`${apiBaseUrl}/graph/${encodeURIComponent(graph.name)}/visualization`, {
+          headers,
+        });
+
+        if (!response.ok) {
+          console.error(`Failed to fetch visualization data: ${response.statusText}`);
+          // Fallback to local data if API fails
+          return prepareLocalGraphData(graph);
+        }
+
+        const visualizationData = await response.json();
+        return {
+          nodes: visualizationData.nodes || [],
+          links: visualizationData.links || [],
+        };
+      } catch (error) {
+        console.error("Error fetching visualization data:", error);
+        // Fallback to local data if API fails
+        return prepareLocalGraphData(graph);
+      }
+    },
+    [apiBaseUrl, createHeaders, prepareLocalGraphData]
+  );
+
+  // Load graph data when visualization is shown
+  useEffect(() => {
+    const loadGraphData = async () => {
+      if (!showVisualization || !selectedGraph) return;
+
+      setLoadingVisualization(true);
+      try {
+        const data = await prepareGraphData(selectedGraph);
+        setGraphData(data);
+      } catch (error) {
+        console.error("Error loading graph data:", error);
+        setGraphData({ nodes: [], links: [] });
+      } finally {
+        setLoadingVisualization(false);
+      }
+    };
+
+    loadGraphData();
+  }, [showVisualization, selectedGraph, prepareGraphData]);
 
   // Observe graph container size changes
   useEffect(() => {
@@ -208,49 +303,132 @@ const GraphSection: React.FC<GraphSectionProps> = ({
     }
   }, [apiBaseUrl, createHeaders]);
 
-  // Fetch graphs on component mount
-  useEffect(() => {
-    fetchGraphs();
-  }, [fetchGraphs]);
+  // Fetch documents
+  const fetchDocuments = useCallback(async () => {
+    if (!apiBaseUrl) return;
 
-  // Fetch a specific graph
-  const fetchGraph = async (graphName: string) => {
+    setLoadingDocuments(true);
     try {
-      setLoading(true);
-      setError(null); // Clear previous errors
-      const headers = createHeaders();
-      const response = await fetch(`${apiBaseUrl}/graph/${encodeURIComponent(graphName)}`, {
+      console.log(`Fetching documents from: ${apiBaseUrl}/documents`);
+      const headers = createHeaders("application/json");
+      const response = await fetch(`${apiBaseUrl}/documents`, {
+        method: "POST",
         headers,
+        body: JSON.stringify({}), // Empty body to fetch all docs
       });
 
       if (!response.ok) {
-        throw new Error(`Failed to fetch graph: ${response.statusText}`);
+        throw new Error(`Failed to fetch documents: ${response.status} ${response.statusText}`);
       }
 
-      const data = await response.json();
-      setSelectedGraph(data);
-      setActiveTab("details"); // Set tab to details view
+      const documentsData = await response.json();
+      console.log("Documents data received:", documentsData);
 
-      // Call the callback if provided
-      if (onSelectGraph) {
-        onSelectGraph(graphName);
-      }
+      if (Array.isArray(documentsData)) {
+        // Transform documents to the format we need (id and filename)
+        const transformedDocs = documentsData
+          .map((doc: ApiDocumentResponse) => {
+            const id = doc.external_id || doc.id;
+            if (!id) return null; // Skip documents without valid IDs
 
-      return data;
-    } catch (err: unknown) {
-      const error = err as Error;
-      setError(`Error fetching graph: ${error.message}`);
-      console.error("Error fetching graph:", err);
-      setSelectedGraph(null); // Reset selected graph on error
-      setActiveTab("list"); // Go back to list view on error
-      if (onSelectGraph) {
-        onSelectGraph(undefined);
+            return {
+              id,
+              filename: doc.filename || doc.name || `Document ${id}`,
+            };
+          })
+          .filter((doc): doc is { id: string; filename: string } => doc !== null);
+
+        setDocuments(transformedDocs);
+      } else {
+        console.error("Expected array for documents data but received:", typeof documentsData);
       }
-      return null;
+    } catch (err) {
+      console.error("Error fetching documents:", err);
     } finally {
-      setLoading(false);
+      setLoadingDocuments(false);
     }
-  };
+  }, [apiBaseUrl, createHeaders]);
+
+  // Fetch graphs on component mount
+  useEffect(() => {
+    fetchGraphs();
+    // Also fetch documents when component mounts
+    if (authToken || apiBaseUrl.includes("localhost")) {
+      console.log("GraphSection: Fetching documents with auth token:", !!authToken);
+      fetchDocuments();
+    }
+  }, [fetchGraphs, fetchDocuments, authToken, apiBaseUrl]);
+
+  // Fetch a specific graph
+  const fetchGraph = useCallback(
+    async (graphName: string) => {
+      try {
+        setLoading(true);
+        setError(null); // Clear previous errors
+        const headers = createHeaders();
+        const response = await fetch(`${apiBaseUrl}/graph/${encodeURIComponent(graphName)}`, {
+          headers,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch graph: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        setSelectedGraph(data);
+        setActiveTab("details"); // Set tab to details view
+
+        // Call the callback if provided
+        if (onSelectGraph) {
+          onSelectGraph(graphName);
+        }
+
+        return data;
+      } catch (err: unknown) {
+        const error = err as Error;
+        setError(`Error fetching graph: ${error.message}`);
+        console.error("Error fetching graph:", err);
+        setSelectedGraph(null); // Reset selected graph on error
+        setActiveTab("list"); // Go back to list view on error
+        if (onSelectGraph) {
+          onSelectGraph(undefined);
+        }
+        return null;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [apiBaseUrl, createHeaders, onSelectGraph]
+  );
+
+  // Check workflow status
+  const checkWorkflowStatus = useCallback(
+    async (workflowId: string, runId?: string): Promise<WorkflowStatusResponse> => {
+      try {
+        const headers = createHeaders();
+        const params = new URLSearchParams();
+        if (runId) {
+          params.append("run_id", runId);
+        }
+
+        const url = `${apiBaseUrl}/graph/workflow/${encodeURIComponent(workflowId)}/status${params.toString() ? `?${params}` : ""}`;
+        const response = await fetch(url, {
+          method: "GET",
+          headers,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to check workflow status: ${response.statusText}`);
+        }
+
+        return await response.json();
+      } catch (err) {
+        console.error("Error checking workflow status:", err);
+        throw err;
+      }
+    },
+    [apiBaseUrl, createHeaders]
+  );
 
   // Handle graph click
   const handleGraphClick = (graph: Graph) => {
@@ -294,7 +472,20 @@ const GraphSection: React.FC<GraphSectionProps> = ({
 
       const data = await response.json();
       setSelectedGraph(data);
-      setActiveTab("details"); // Switch to details tab after creation
+
+      // Check if this is an async operation
+      if (data.system_metadata?.workflow_id) {
+        // Graph is processing asynchronously
+        setActiveTab("details"); // Switch to details tab to show processing state
+        showAlert("Your graph is being created in the background. This may take a few minutes.", {
+          type: "info",
+          title: "Graph Creation Started",
+          duration: 5000,
+        });
+      } else {
+        // Legacy synchronous response
+        setActiveTab("details"); // Switch to details tab after creation
+      }
 
       // Invoke callback before refresh
       onGraphCreate?.(graphName, graphDocuments.length);
@@ -355,7 +546,20 @@ const GraphSection: React.FC<GraphSectionProps> = ({
 
       const data = await response.json();
       setSelectedGraph(data);
-      setActiveTab("details"); // Update the selected graph data
+
+      // Check if this is an async operation
+      if (data.system_metadata?.workflow_id) {
+        // Graph update is processing asynchronously
+        setActiveTab("details"); // Stay on details tab to show processing state
+        showAlert("Your graph is being updated in the background. This may take a few minutes.", {
+          type: "info",
+          title: "Graph Update Started",
+          duration: 5000,
+        });
+      } else {
+        // Legacy synchronous response
+        setActiveTab("details"); // Update the selected graph data
+      }
 
       // Invoke callback before refresh
       onGraphUpdate?.(selectedGraph.name, additionalDocuments.length);
@@ -367,8 +571,10 @@ const GraphSection: React.FC<GraphSectionProps> = ({
       setAdditionalDocuments([]);
       setAdditionalFilters("{}");
 
-      // Switch back to details tab
-      setActiveTab("details");
+      // Only switch back if not async
+      if (!data.system_metadata?.workflow_id) {
+        setActiveTab("details");
+      }
     } catch (err: unknown) {
       const error = err as Error;
       setError(`Error updating graph: ${error.message}`);
@@ -381,26 +587,56 @@ const GraphSection: React.FC<GraphSectionProps> = ({
 
   // Removed useEffect that depended on initializeGraph
 
-  // Poll for processing graphs
+  // Poll for processing graphs and workflow status
   useEffect(() => {
-    // Start polling only if at least one graph is processing
-    const hasProcessing = graphs.some(g => g.system_metadata?.status === "processing");
+    // Find graphs that are processing and have workflow_id
+    const processingGraphs = graphs.filter(
+      g => g.system_metadata?.status === "processing" && g.system_metadata?.workflow_id
+    );
 
-    if (!hasProcessing) return; // No need to poll
+    if (processingGraphs.length === 0) return; // No need to poll
 
     const id = setInterval(async () => {
-      await fetchGraphs();
-      // Refresh selected graph if it is still processing
-      if (selectedGraph?.system_metadata?.status === "processing") {
-        await fetchGraph(selectedGraph.name);
-      }
+      // Check workflow status for each processing graph
+      const statusChecks = processingGraphs.map(async graph => {
+        if (graph.system_metadata?.workflow_id) {
+          try {
+            const result = await checkWorkflowStatus(graph.system_metadata.workflow_id, graph.system_metadata.run_id);
+
+            // If workflow is completed or failed, refresh the graph list
+            if (result.status === "completed" || result.status === "failed") {
+              await fetchGraphs();
+              // If this is the selected graph, refresh it too
+              if (selectedGraph?.name === graph.name) {
+                await fetchGraph(graph.name);
+              }
+            }
+          } catch (err) {
+            console.error(`Error checking workflow status for graph ${graph.name}:`, err);
+          }
+        }
+      });
+
+      await Promise.all(statusChecks);
     }, POLL_INTERVAL_MS);
 
     return () => clearInterval(id);
-  }, [graphs, selectedGraph, fetchGraphs]);
+  }, [graphs, selectedGraph, fetchGraphs, fetchGraph, checkWorkflowStatus]);
 
   // Conditional rendering based on visualization state
   if (showVisualization && selectedGraph) {
+    // Handle node click for sidebar
+    const handleNodeClick = (node: NodeObject | null) => {
+      setSelectedNode(node);
+      setSidebarOpen(!!node);
+    };
+
+    // Handle sidebar close
+    const handleSidebarClose = () => {
+      setSelectedNode(null);
+      setSidebarOpen(false);
+    };
+
     return (
       <div className="fixed inset-0 z-50 flex flex-col bg-background">
         {/* Visualization header */}
@@ -440,16 +676,27 @@ const GraphSection: React.FC<GraphSectionProps> = ({
 
         {/* Graph visualization container */}
         <div ref={graphContainerRef} className="relative flex-1">
-          {graphDimensions.width > 0 && graphDimensions.height > 0 && (
+          {loadingVisualization ? (
+            <div className="flex h-full items-center justify-center">
+              <div className="text-center">
+                <div className="mx-auto mb-2 h-8 w-8 animate-spin rounded-full border-b-2 border-primary"></div>
+                <p className="text-sm text-muted-foreground">Loading graph visualization...</p>
+              </div>
+            </div>
+          ) : graphDimensions.width > 0 && graphDimensions.height > 0 ? (
             <ForceGraphComponent
-              data={prepareGraphData(selectedGraph)}
+              data={graphData}
               width={graphDimensions.width}
               height={graphDimensions.height}
               showNodeLabels={showNodeLabels}
               showLinkLabels={showLinkLabels}
+              onNodeClick={handleNodeClick}
             />
-          )}
+          ) : null}
         </div>
+
+        {/* Node Details Sidebar */}
+        {selectedNode && <NodeDetailsSidebar node={selectedNode} onClose={handleSidebarClose} isOpen={sidebarOpen} />}
       </div>
     );
   }
@@ -498,24 +745,33 @@ const GraphSection: React.FC<GraphSectionProps> = ({
                       <h3 className="text-md mb-3 font-medium">Document Selection</h3>
                       <div className="space-y-4">
                         <div className="space-y-2">
-                          <Label htmlFor="graph-documents">Document IDs (Optional)</Label>
-                          <Textarea
-                            id="graph-documents"
-                            placeholder="Enter document IDs separated by commas"
-                            value={graphDocuments.join(", ")}
-                            onChange={e =>
-                              setGraphDocuments(
-                                e.target.value
-                                  .split(",")
-                                  .map(id => id.trim())
-                                  .filter(id => id)
-                              )
-                            }
-                            className="min-h-[80px]"
+                          <Label htmlFor="graph-documents">Documents</Label>
+                          <MultiSelect
+                            options={[
+                              { label: "All Documents", value: "__none__" },
+                              ...(loadingDocuments ? [{ label: "Loading documents...", value: "loading" }] : []),
+                              ...documents.map(doc => ({
+                                label: doc.filename,
+                                value: doc.id,
+                              })),
+                            ]}
+                            selected={graphDocuments}
+                            onChange={(value: string[]) => {
+                              const filteredValues = value.filter(v => v !== "__none__");
+                              setGraphDocuments(filteredValues);
+                            }}
+                            placeholder="Select documents for the graph"
+                            className="w-full"
                           />
                           <p className="text-xs text-muted-foreground">
-                            Specify document IDs to include in the graph, or leave empty and use filters below.
+                            Select specific documents to include in the graph, or leave empty and use filters below.
                           </p>
+                        </div>
+
+                        <div className="relative flex items-center">
+                          <div className="flex-grow border-t border-muted"></div>
+                          <span className="mx-4 flex-shrink text-xs uppercase text-muted-foreground">Or</span>
+                          <div className="flex-grow border-t border-muted"></div>
                         </div>
 
                         <div className="space-y-2">
@@ -815,23 +1071,26 @@ const GraphSection: React.FC<GraphSectionProps> = ({
                   </div>
                   <div className="space-y-4">
                     <div className="space-y-2">
-                      <Label htmlFor="additional-documents">Additional Document IDs</Label>
-                      <Textarea
-                        id="additional-documents"
-                        placeholder="Enter document IDs separated by commas"
-                        value={additionalDocuments.join(", ")}
-                        onChange={e =>
-                          setAdditionalDocuments(
-                            e.target.value
-                              .split(",")
-                              .map(id => id.trim())
-                              .filter(id => id)
-                          )
-                        }
-                        className="min-h-[80px]"
+                      <Label htmlFor="additional-documents">Additional Documents</Label>
+                      <MultiSelect
+                        options={[
+                          { label: "All Documents", value: "__none__" },
+                          ...(loadingDocuments ? [{ label: "Loading documents...", value: "loading" }] : []),
+                          ...documents.map(doc => ({
+                            label: doc.filename,
+                            value: doc.id,
+                          })),
+                        ]}
+                        selected={additionalDocuments}
+                        onChange={(value: string[]) => {
+                          const filteredValues = value.filter(v => v !== "__none__");
+                          setAdditionalDocuments(filteredValues);
+                        }}
+                        placeholder="Select additional documents"
+                        className="w-full"
                       />
                       <p className="text-xs text-muted-foreground">
-                        Specify additional document IDs to include in the graph.
+                        Select additional documents to include in the graph.
                       </p>
                     </div>
 
@@ -857,7 +1116,7 @@ const GraphSection: React.FC<GraphSectionProps> = ({
                   </div>
                   <Button
                     onClick={handleUpdateGraph}
-                    disabled={loading || (additionalDocuments.length === 0 && additionalFilters === "{}")} // Disable if no input
+                    disabled={loading || (additionalDocuments.length === 0 && additionalFilters === "{}")}
                     className="w-full"
                   >
                     {loading ? (

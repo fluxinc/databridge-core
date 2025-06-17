@@ -44,6 +44,10 @@ class CompletionQueryRequest(RetrieveRequest):
         None,
         description="Optional chat session ID for persisting conversation history",
     )
+    stream_response: Optional[bool] = Field(
+        False,
+        description="Whether to stream the response back in chunks",
+    )
 
 
 class IngestTextRequest(BaseModel):
@@ -147,3 +151,7 @@ class AgentQueryRequest(BaseModel):
     """Request model for agent queries"""
 
     query: str = Field(..., description="Natural language query for the Morphik agent")
+    chat_id: Optional[str] = Field(
+        None,
+        description="Optional chat session ID for persisting conversation history",
+    )

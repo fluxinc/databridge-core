@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import arq  # Added for Redis
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -53,6 +53,42 @@ class IngestFromConnectorRequest(BaseModel):
     rules: Optional[List[Dict[str, Any]]] = None  # New field for custom rules
 
 
+# Add request model for manual credentials
+class ManualCredentialsRequest(BaseModel):
+    """Request model for manual credential submission."""
+
+    credentials: Dict[str, Any]
+
+
+# Models for auth initiation responses
+class CredentialFieldOption(BaseModel):
+    value: str
+    label: str
+
+
+class CredentialField(BaseModel):
+    name: str
+    label: str
+    description: str
+    type: str  # "text", "password", "select"
+    required: bool
+    options: Optional[List[CredentialFieldOption]] = None
+
+
+class ManualCredentialsAuthResponse(BaseModel):
+    auth_type: str  # "manual_credentials"
+    required_fields: List[CredentialField]
+    instructions: Optional[str] = None
+
+
+class OAuthAuthResponse(BaseModel):
+    authorization_url: str
+
+
+# Union type for auth responses
+AuthInitiateResponse = Union[ManualCredentialsAuthResponse, OAuthAuthResponse]
+
+
 # Endpoints will be added below
 
 
@@ -83,7 +119,7 @@ async def get_auth_status_for_connector(
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
 
 
-@router.get("/{connector_type}/auth/initiate_url", response_model=Dict[str, str])
+@router.get("/{connector_type}/auth/initiate_url", response_model=AuthInitiateResponse)
 async def get_initiate_auth_url(
     request: Request,
     connector_type: str,
@@ -95,12 +131,21 @@ async def get_initiate_auth_url(
     The method mirrors the logic of the `/auth/initiate` endpoint but sends a
     JSON payload instead of a redirect so that browsers can stay on the same
     origin until they intentionally navigate away.
+
+    For OAuth-based connectors, this returns authorization_url.
+    For manual credential connectors, this returns the credential form specification.
     """
 
     try:
         connector = await service.get_connector(connector_type)
         auth_details = await connector.initiate_auth()
 
+        # Check if this is a manual credentials flow
+        if auth_details.get("auth_type") == "manual_credentials":
+            # For manual credentials, return the form specification directly
+            return ManualCredentialsAuthResponse(**auth_details)
+
+        # For OAuth flows, continue with existing logic
         authorization_url = auth_details.get("authorization_url")
         state = auth_details.get("state")
 
@@ -124,7 +169,7 @@ async def get_initiate_auth_url(
 
         logger.info("Prepared auth URL for '%s' for user '%s'.", connector_type, service.user_identifier)
 
-        return {"authorization_url": authorization_url}
+        return OAuthAuthResponse(authorization_url=authorization_url)
 
     except ValueError as ve:
         logger.warning("Auth URL preparation for '%s' failed: %s", connector_type, ve)
@@ -251,6 +296,49 @@ async def connector_oauth_callback(
             f"Unexpected error during OAuth callback for '{connector_type}' for user '{user_id_for_log}': {e}"
         )
         raise HTTPException(status_code=500, detail="Internal server error during authentication callback.")
+
+
+@router.post("/{connector_type}/auth/finalize", response_model=Dict[str, Any])
+async def finalize_manual_auth(
+    connector_type: str,
+    credentials_request: ManualCredentialsRequest,
+    service: ConnectorService = Depends(get_connector_service),
+):
+    """Finalize authentication using manual credentials.
+
+    This endpoint is used for connectors that require manual credential input
+    (like Zotero) instead of OAuth flows.
+    """
+    try:
+        connector = await service.get_connector(connector_type)
+
+        # Attempt to finalize authentication with the provided credentials
+        success = await connector.finalize_auth(credentials_request.credentials)
+
+        if success:
+            logger.info(
+                f"Successfully finalized manual authentication for '{connector_type}' for user '{service.user_identifier}'."
+            )
+            return {"status": "success", "message": f"Successfully authenticated with {connector_type}."}
+        else:
+            logger.error(
+                f"Failed to finalize manual auth for '{connector_type}' with user '{service.user_identifier}' "
+                f"(connector returned False)."
+            )
+            raise HTTPException(status_code=400, detail="Invalid credentials provided.")
+
+    except ValueError as ve:
+        logger.error(f"Error during manual auth for '{connector_type}' for user '{service.user_identifier}': {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
+    except NotImplementedError:
+        logger.error(f"Connector '{connector_type}' is not fully implemented for manual auth finalization.")
+        raise HTTPException(status_code=501, detail=f"Connector '{connector_type}' not fully implemented.")
+    except Exception as e:
+        user_id_for_log = service.user_identifier if "service" in locals() else "unknown user"
+        logger.exception(
+            f"Unexpected error during manual auth for '{connector_type}' for user '{user_id_for_log}': {e}"
+        )
+        raise HTTPException(status_code=500, detail="Internal server error during manual authentication.")
 
 
 # Response model for list_files

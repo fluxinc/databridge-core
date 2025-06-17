@@ -717,6 +717,28 @@ class PostgresDatabase(BaseDatabase):
                 if doc_model:
                     await session.delete(doc_model)
                     await session.commit()
+
+                    # --------------------------------------------------------------------------------
+                    # Maintain referential integrity: remove the deleted document ID from any folders
+                    # that still list it in their document_ids JSONB array.  This prevents the UI from
+                    # requesting stale IDs after a delete.
+                    # --------------------------------------------------------------------------------
+                    try:
+                        await session.execute(
+                            text(
+                                """
+                                UPDATE folders
+                                SET document_ids = document_ids - :doc_id
+                                WHERE document_ids ? :doc_id
+                                """
+                            ),
+                            {"doc_id": document_id},
+                        )
+                        await session.commit()
+                    except Exception as upd_err:  # noqa: BLE001
+                        # Non-fatal – log but keep the document deleted so user doesn't see it any more.
+                        logger.error("Failed to remove deleted document %s from folders: %s", document_id, upd_err)
+
                     return True
                 return False
 
@@ -820,11 +842,17 @@ class PostgresDatabase(BaseDatabase):
         else:
             filters = base_clauses.copy()
 
-        # In cloud mode further restrict by user_id when available (used for multi-tenant
-        # end-user isolation).
-        if auth.user_id:
+        # In cloud mode, allow end-users to access their resources via the `user_id` ACL –
+        # *except* when we are already scoping a developer token to a specific ``app_id``.
+        #
+        # Including the user_id clause for developer-scoped requests would broaden the
+        # predicate from an AND (by app_id) to an OR, inadvertently exposing documents or
+        # graphs that belong to *other* applications of the same developer.  Therefore we
+        # only append the user_id shortcut when **either** (a) we are *not* dealing with a
+        # developer token, **or** (b) the token has no explicit app_id scope.
+        if auth.user_id and not (auth.entity_type == EntityType.DEVELOPER and auth.app_id is not None):
             if get_settings().MODE == "cloud":
-                # access_control.user_id is a list in the DocumentModel, so `?` is correct and uses the GIN index.
+                # access_control.user_id is a list in the JSONB column; `?` uses the GIN index.
                 filters.append(f"access_control->'user_id' ? '{auth.user_id}'")
 
         return " OR ".join(filters)
@@ -881,26 +909,30 @@ class PostgresDatabase(BaseDatabase):
         key_clauses: List[str] = []
 
         for key, value in system_filters.items():
-            if value is None:
-                continue
-
             # Normalise to a list for uniform processing.
             values = value if isinstance(value, list) else [value]
-            if not values:
+            if not values and value is not None:
                 continue
 
             value_clauses = []
             for item in values:
-                # New approach: Use JSONB containment operator @>
-                # This allows matching native JSON types (boolean, number, string)
-                # and leverages the GIN index on the system_metadata column.
-                json_filter_object = {key: item}
-                # json.dumps will correctly format item as a JSON string, number, or boolean
-                json_string_for_sql = json.dumps(json_filter_object)
-                # Escape single quotes within the generated JSON string for SQL literal
-                sql_escaped_json_string = json_string_for_sql.replace("'", "''")
+                if item is None:
+                    # Special handling for None values - check for null in JSON
+                    json_filter_object = {key: None}
+                    json_string_for_sql = json.dumps(json_filter_object)
+                    sql_escaped_json_string = json_string_for_sql.replace("'", "''")
+                    value_clauses.append(f"system_metadata @> '{sql_escaped_json_string}'::jsonb")
+                else:
+                    # Use JSONB containment operator @>
+                    # This allows matching native JSON types (boolean, number, string)
+                    # and leverages the GIN index on the system_metadata column.
+                    json_filter_object = {key: item}
+                    # json.dumps will correctly format item as a JSON string, number, or boolean
+                    json_string_for_sql = json.dumps(json_filter_object)
+                    # Escape single quotes within the generated JSON string for SQL literal
+                    sql_escaped_json_string = json_string_for_sql.replace("'", "''")
 
-                value_clauses.append(f"system_metadata @> '{sql_escaped_json_string}'::jsonb")
+                    value_clauses.append(f"system_metadata @> '{sql_escaped_json_string}'::jsonb")
 
             # OR all alternative values for this key, wrap in parentheses.
             key_clauses.append("(" + " OR ".join(value_clauses) + ")")

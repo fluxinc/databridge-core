@@ -266,12 +266,19 @@ class MorphikParser(BaseParser):
         # `hi_res` on plain PDFs/Word docs invokes OCR which can be 20-30×
         # slower.  A simple extension check covers the majority of cases.
         strategy = "hi_res"
-        if filename.lower().endswith((".pdf", ".doc", ".docx", ".txt")):
+        file_content_type: Optional[str] = None  # Default to None for auto-detection
+        if filename.lower().endswith((".pdf", ".doc", ".docx")):
             strategy = "fast"
+        elif filename.lower().endswith(".txt"):
+            strategy = "fast"
+            file_content_type = "text/plain"  # Explicitly set for .txt files
+        elif filename.lower().endswith(".json"):
+            strategy = "fast"  # or can be omitted if it doesn't apply to json
+            file_content_type = "application/json"  # Explicitly set for .json files
 
         elements = partition(
             file=io.BytesIO(file),
-            content_type=None,
+            content_type=file_content_type,  # Use the determined content_type
             metadata_filename=filename,
             strategy=strategy,
             api_key=self._unstructured_api_key if self.use_unstructured_api else None,

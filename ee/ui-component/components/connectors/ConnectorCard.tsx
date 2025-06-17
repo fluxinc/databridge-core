@@ -6,10 +6,15 @@ import {
   initiateConnectorAuth,
   disconnectConnector,
   ingestConnectorFile,
+  submitManualCredentials,
   type ConnectorAuthStatus,
+  type CredentialField,
 } from "@/lib/connectorsApi";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { PlugZap, Unplug, AlertCircle, Loader2, FileText } from "lucide-react";
 import { FileBrowser } from "./FileBrowser";
 import { Textarea } from "@/components/ui/textarea";
@@ -43,6 +48,12 @@ export function ConnectorCard({
   const [ingestionMetadata, setIngestionMetadata] = useState<string>("{}"); // Default to empty JSON object
   const [ingestionRules, setIngestionRules] = useState<string>("[]"); // Default to empty JSON array
 
+  // State for manual credentials modal
+  const [showCredentialsModal, setShowCredentialsModal] = useState<boolean>(false);
+  const [credentialFields, setCredentialFields] = useState<CredentialField[]>([]);
+  const [credentialValues, setCredentialValues] = useState<Record<string, string>>({});
+  const [credentialInstructions, setCredentialInstructions] = useState<string>("");
+
   const fetchStatus = useCallback(async () => {
     setIsLoading(true);
     setError(null);
@@ -61,7 +72,7 @@ export function ConnectorCard({
     fetchStatus();
   }, [fetchStatus]);
 
-  const handleConnect = () => {
+  const handleConnect = async () => {
     setError(null);
     setIsSubmitting(true);
     try {
@@ -69,9 +80,54 @@ export function ConnectorCard({
       const connectionsSectionUrl = new URL(window.location.origin);
       connectionsSectionUrl.pathname = "/"; // Ensure we are at the root path
       connectionsSectionUrl.searchParams.set("section", "connections");
-      initiateConnectorAuth(apiBaseUrl, connectorType, connectionsSectionUrl.toString(), authToken);
+
+      const authResponse = await initiateConnectorAuth(
+        apiBaseUrl,
+        connectorType,
+        connectionsSectionUrl.toString(),
+        authToken
+      );
+
+      // Check if this is a manual credentials flow
+      if ("auth_type" in authResponse && authResponse.auth_type === "manual_credentials") {
+        // Handle manual credentials flow
+        setCredentialFields(authResponse.required_fields);
+        setCredentialInstructions(authResponse.instructions || "");
+        // Initialize credential values
+        const initialValues: Record<string, string> = {};
+        authResponse.required_fields.forEach(field => {
+          initialValues[field.name] = "";
+        });
+        setCredentialValues(initialValues);
+        setShowCredentialsModal(true);
+      }
+      // For OAuth flows, the function already handles redirection
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to initiate connection.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSubmitCredentials = async () => {
+    setError(null);
+    setIsSubmitting(true);
+    try {
+      // Validate required fields
+      const missingFields = credentialFields
+        .filter(field => field.required && !credentialValues[field.name]?.trim())
+        .map(field => field.label);
+
+      if (missingFields.length > 0) {
+        throw new Error(`Please fill in the following required fields: ${missingFields.join(", ")}`);
+      }
+
+      await submitManualCredentials(apiBaseUrl, connectorType, credentialValues, authToken);
+      setShowCredentialsModal(false);
+      await fetchStatus(); // Refresh status to show connected state
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to submit credentials.");
+    } finally {
       setIsSubmitting(false);
     }
   };
@@ -145,39 +201,45 @@ export function ConnectorCard({
               Connect to {displayName}
             </Button>
           </div>
+        ) : !isLoading && !error && authStatus && !authStatus.is_authenticated ? (
+          <div className="flex min-h-[60px] items-center justify-center rounded-lg border bg-gray-50 p-4 dark:bg-gray-800/30">
+            <Button onClick={handleConnect} disabled={isSubmitting} size="lg">
+              {isSubmitting ? <Loader2 className="mr-2 h-5 w-5 animate-spin" /> : <PlugZap className="mr-2 h-5 w-5" />}
+              Connect to {displayName}
+            </Button>
+          </div>
         ) : (
-          /* Original detailed view for other states (loading, error, connected, unconnectable) */
-          <div
-            className={`min-h-[60px] rounded-lg border p-4 ${authStatus?.is_authenticated ? "border-green-200 bg-green-50 dark:border-green-700 dark:bg-green-900/30" : "bg-gray-50 dark:bg-gray-800/30"}`}
-          >
+          <div className="rounded-lg border bg-gray-50 p-4 dark:bg-gray-800/30">
             <div className="flex items-center justify-between">
-              <div>
-                <h3 className="font-semibold">Connection Status</h3>
+              <div className="space-y-1">
                 {isLoading && (
-                  <div className="flex items-center space-x-2 text-sm text-muted-foreground">
-                    <Loader2 className="h-5 w-5 animate-spin" />
-                    <span>Loading status...</span>
-                  </div>
-                )}
-                {!isLoading && error && (
-                  <div className="flex items-center space-x-2 text-sm text-red-600">
-                    <AlertCircle className="h-5 w-5" />
-                    <span>Error: {error}</span>
-                  </div>
-                )}
-                {!isLoading && !error && authStatus && (
                   <div className="flex items-center space-x-2 text-sm">
-                    {authStatus.is_authenticated ? (
-                      <PlugZap className="h-5 w-5 text-green-600" />
-                    ) : (
-                      <Unplug className="h-5 w-5 text-gray-500" />
-                    )}
-                    <span>
-                      {authStatus.is_authenticated ? "Connected" : "Not Connected"}
-                      {authStatus.message && !authStatus.is_authenticated && ` - ${authStatus.message}`}
-                    </span>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Checking connection status...</span>
                   </div>
                 )}
+
+                {!isLoading && authStatus?.is_authenticated && (
+                  <div className="flex items-center space-x-2 text-sm text-green-700 dark:text-green-400">
+                    <div className="h-2 w-2 rounded-full bg-green-500"></div>
+                    <span>{authStatus.message || `Connected to ${displayName}`}</span>
+                  </div>
+                )}
+
+                {!isLoading && authStatus && !authStatus.is_authenticated && (
+                  <div className="flex items-center space-x-2 text-sm text-gray-500">
+                    <div className="h-2 w-2 rounded-full bg-gray-400"></div>
+                    <span>{authStatus.message || `Not connected to ${displayName}`}</span>
+                  </div>
+                )}
+
+                {error && (
+                  <div className="flex items-center space-x-2 text-sm text-red-600 dark:text-red-400">
+                    <AlertCircle className="h-4 w-4" />
+                    <span>{error}</span>
+                  </div>
+                )}
+
                 {!isLoading && !error && !authStatus && (
                   <div className="flex items-center space-x-2 text-sm text-gray-500">
                     <AlertCircle className="h-5 w-5" />
@@ -197,7 +259,7 @@ export function ConnectorCard({
                       Disconnect
                     </Button>
                   ) : (
-                    <Button onClick={handleConnect} disabled={isSubmitting || !authStatus.auth_url}>
+                    <Button onClick={handleConnect} disabled={isSubmitting}>
                       {isSubmitting ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
@@ -221,6 +283,74 @@ export function ConnectorCard({
           </div>
         )}
       </CardContent>
+
+      {/* Manual Credentials Modal */}
+      <Dialog open={showCredentialsModal} onOpenChange={setShowCredentialsModal}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Connect to {displayName}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            {credentialInstructions && (
+              <div className="rounded-md bg-blue-50 p-3 text-sm text-blue-700 dark:bg-blue-950/30 dark:text-blue-300">
+                {credentialInstructions}
+              </div>
+            )}
+
+            {credentialFields.map(field => (
+              <div key={field.name} className="space-y-2">
+                <Label htmlFor={field.name}>
+                  {field.label}
+                  {field.required && <span className="text-red-500">*</span>}
+                </Label>
+                {field.description && <p className="text-sm text-gray-600 dark:text-gray-400">{field.description}</p>}
+
+                {field.type === "select" ? (
+                  <Select
+                    value={credentialValues[field.name] || ""}
+                    onValueChange={value => setCredentialValues(prev => ({ ...prev, [field.name]: value }))}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder={`Select ${field.label}`} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {field.options?.map(option => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id={field.name}
+                    type={field.type}
+                    value={credentialValues[field.name] || ""}
+                    onChange={e => setCredentialValues(prev => ({ ...prev, [field.name]: e.target.value }))}
+                    placeholder={field.description}
+                    required={field.required}
+                  />
+                )}
+              </div>
+            ))}
+
+            {error && (
+              <div className="rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-700 dark:border-red-700 dark:bg-red-900/30 dark:text-red-300">
+                <AlertCircle className="mr-1 inline h-4 w-4" /> {error}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline">Cancel</Button>
+            </DialogClose>
+            <Button onClick={handleSubmitCredentials} disabled={isSubmitting}>
+              {isSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Connect
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* File Browser Modal */}
       <Dialog open={showFileBrowserModal} onOpenChange={setShowFileBrowserModal}>

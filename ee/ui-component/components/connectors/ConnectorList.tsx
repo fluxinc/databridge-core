@@ -1,7 +1,7 @@
 "use client";
 
 import { ConnectorCard } from "./ConnectorCard";
-import { BookLock } from "lucide-react"; // Example icon for Google Drive
+import { BookLock, BookOpen } from "lucide-react"; // Example icon for Google Drive and Zotero
 
 // In the future, this could come from a configuration or an API call
 const availableConnectors = [
@@ -10,6 +10,12 @@ const availableConnectors = [
     displayName: "Google Drive",
     icon: BookLock, // Using an appropriate icon from lucide-react
     description: "Access files and folders from your Google Drive.",
+  },
+  {
+    connectorType: "zotero",
+    displayName: "Zotero",
+    icon: BookOpen, // Using an appropriate icon for Zotero
+    description: "Access your Zotero library and research papers.",
   },
   // Add other connectors here as they are implemented
   // {

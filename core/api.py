@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time  # Add time import for profiling
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
@@ -9,6 +10,7 @@ import jwt
 import tomli
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -16,6 +18,7 @@ from core.agent import MorphikAgent
 from core.app_factory import lifespan
 from core.auth_utils import verify_token
 from core.config import get_settings
+from core.logging_config import setup_logging
 from core.database.postgres_database import PostgresDatabase
 from core.dependencies import get_redis_pool
 from core.limits_utils import check_and_increment_limits
@@ -40,8 +43,61 @@ from core.routes.ingest import router as ingest_router
 from core.services.telemetry import TelemetryService
 from core.services_init import document_service
 
+# Set up logging configuration for Docker environment
+setup_logging()
+
 # Initialize FastAPI app
 logger = logging.getLogger(__name__)
+
+
+# Performance tracking class
+class PerformanceTracker:
+    def __init__(self, operation_name: str):
+        self.operation_name = operation_name
+        self.start_time = time.time()
+        self.phases = {}
+        self.current_phase = None
+        self.phase_start = None
+
+    def start_phase(self, phase_name: str):
+        # End current phase if one is running
+        if self.current_phase and self.phase_start:
+            self.phases[self.current_phase] = time.time() - self.phase_start
+
+        # Start new phase
+        self.current_phase = phase_name
+        self.phase_start = time.time()
+
+    def end_phase(self):
+        if self.current_phase and self.phase_start:
+            self.phases[self.current_phase] = time.time() - self.phase_start
+            self.current_phase = None
+            self.phase_start = None
+
+    def add_suboperation(self, name: str, duration: float):
+        """Add a sub-operation timing"""
+        self.phases[name] = duration
+
+    def log_summary(self, additional_info: str = ""):
+        total_time = time.time() - self.start_time
+
+        # End current phase if still running
+        if self.current_phase and self.phase_start:
+            self.phases[self.current_phase] = time.time() - self.phase_start
+
+        logger.info(f"=== {self.operation_name} Performance Summary ===")
+        logger.info(f"Total time: {total_time:.2f}s")
+
+        # Sort phases by duration (longest first)
+        for phase, duration in sorted(self.phases.items(), key=lambda x: x[1], reverse=True):
+            percentage = (duration / total_time) * 100 if total_time > 0 else 0
+            logger.info(f"  - {phase}: {duration:.2f}s ({percentage:.1f}%)")
+
+        if additional_info:
+            logger.info(additional_info)
+        logger.info("=" * (len(self.operation_name) + 31))
+
+
 # ---------------------------------------------------------------------------
 # Application instance & core initialisation (moved lifespan, rest unchanged)
 # ---------------------------------------------------------------------------
@@ -110,6 +166,19 @@ app.include_router(ingest_router)
 # Single MorphikAgent instance (tool definitions cached)
 morphik_agent = MorphikAgent(document_service=document_service)
 
+
+# Helper function to normalize folder_name parameter
+def normalize_folder_name(folder_name: Optional[Union[str, List[str]]]) -> Optional[Union[str, List[str]]]:
+    """Convert string 'null' to None for folder_name parameter."""
+    if folder_name is None:
+        return None
+    if isinstance(folder_name, str):
+        return None if folder_name.lower() == "null" else folder_name
+    if isinstance(folder_name, list):
+        return [None if f.lower() == "null" else f for f in folder_name]
+    return folder_name
+
+
 # Enterprise-only routes (optional)
 try:
     from ee.routers import init_app as _init_ee_app  # type: ignore  # noqa: E402
@@ -145,8 +214,13 @@ async def retrieve_chunks(request: RetrieveRequest, auth: AuthContext = Depends(
     Returns:
         List[ChunkResult]: List of relevant chunks
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker(f"Retrieve Chunks: '{request.query[:50]}...'")
+
     try:
-        return await document_service.retrieve_chunks(
+        # Main retrieval operation
+        perf.start_phase("document_service_retrieve_chunks")
+        results = await document_service.retrieve_chunks(
             request.query,
             auth,
             request.filters,
@@ -156,7 +230,13 @@ async def retrieve_chunks(request: RetrieveRequest, auth: AuthContext = Depends(
             request.use_colpali,
             request.folder_name,
             request.end_user_id,
+            perf,  # Pass performance tracker
         )
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)} chunks")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -182,8 +262,13 @@ async def retrieve_documents(request: RetrieveRequest, auth: AuthContext = Depen
     Returns:
         List[DocumentResult]: List of relevant documents
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker(f"Retrieve Docs: '{request.query[:50]}...'")
+
     try:
-        return await document_service.retrieve_docs(
+        # Main retrieval operation
+        perf.start_phase("document_service_retrieve_docs")
+        results = await document_service.retrieve_docs(
             request.query,
             auth,
             request.filters,
@@ -194,6 +279,11 @@ async def retrieve_documents(request: RetrieveRequest, auth: AuthContext = Depen
             request.folder_name,
             request.end_user_id,
         )
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)} documents")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -214,25 +304,39 @@ async def batch_get_documents(request: Dict[str, Any], auth: AuthContext = Depen
     Returns:
         List[Document]: List of documents matching the IDs
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker("Batch Get Documents")
+
     try:
         # Extract document_ids from request
+        perf.start_phase("request_extraction")
         document_ids = request.get("document_ids", [])
         folder_name = request.get("folder_name")
         end_user_id = request.get("end_user_id")
 
         if not document_ids:
+            perf.log_summary("No document IDs provided")
             return []
 
         # Create system filters for folder and user scoping
+        perf.start_phase("filter_creation")
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
         if auth.app_id:
             system_filters["app_id"] = auth.app_id
 
-        return await document_service.batch_retrieve_documents(document_ids, auth, folder_name, end_user_id)
+        # Main batch retrieval operation
+        perf.start_phase("batch_retrieve_documents")
+        results = await document_service.batch_retrieve_documents(document_ids, auth, folder_name, end_user_id)
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)}/{len(document_ids)} documents")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -254,17 +358,23 @@ async def batch_get_chunks(request: Dict[str, Any], auth: AuthContext = Depends(
     Returns:
         List[ChunkResult]: List of chunk results
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker("Batch Get Chunks")
+
     try:
         # Extract sources from request
+        perf.start_phase("request_extraction")
         sources = request.get("sources", [])
         folder_name = request.get("folder_name")
         end_user_id = request.get("end_user_id")
         use_colpali = request.get("use_colpali")
 
         if not sources:
+            perf.log_summary("No sources provided")
             return []
 
         # Convert sources to ChunkSource objects if needed
+        perf.start_phase("source_conversion")
         chunk_sources = []
         for source in sources:
             if isinstance(source, dict):
@@ -273,15 +383,26 @@ async def batch_get_chunks(request: Dict[str, Any], auth: AuthContext = Depends(
                 chunk_sources.append(source)
 
         # Create system filters for folder and user scoping
+        perf.start_phase("filter_creation")
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
         if auth.app_id:
             system_filters["app_id"] = auth.app_id
 
-        return await document_service.batch_retrieve_chunks(chunk_sources, auth, folder_name, end_user_id, use_colpali)
+        # Main batch retrieval operation
+        perf.start_phase("batch_retrieve_chunks")
+        results = await document_service.batch_retrieve_chunks(
+            chunk_sources, auth, folder_name, end_user_id, use_colpali
+        )
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)}/{len(sources)} chunks")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -322,11 +443,17 @@ async def query_completion(
     Returns:
         CompletionResponse: Generated text completion or structured output
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker(f"Query: '{request.query[:50]}...'")
+
     try:
         # Validate prompt overrides before proceeding
+        perf.start_phase("prompt_validation")
         if request.prompt_overrides:
             validate_prompt_overrides_with_http_exception(request.prompt_overrides, operation_type="query")
 
+        # Chat history retrieval
+        perf.start_phase("chat_history_retrieval")
         history_key = None
         history: List[Dict[str, Any]] = []
         if request.chat_id:
@@ -351,11 +478,14 @@ async def query_completion(
             )
 
         # Check query limits if in cloud mode
+        perf.start_phase("limits_check")
         if settings.MODE == "cloud" and auth.user_id:
             # Check limits before proceeding
             await check_and_increment_limits(auth, "query", 1)
 
-        response = await document_service.query(
+        # Main query processing
+        perf.start_phase("document_service_query")
+        result = await document_service.query(
             request.query,
             auth,
             request.filters,
@@ -373,25 +503,94 @@ async def query_completion(
             request.end_user_id,
             request.schema,
             history,
+            perf,  # Pass performance tracker
+            request.stream_response,
         )
 
-        if history_key:
-            history.append(
-                {
-                    "role": "assistant",
-                    "content": response.completion,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-            )
-            await redis.set(history_key, json.dumps(history))
-            await document_service.db.upsert_chat_history(
-                request.chat_id,
-                auth.user_id,
-                auth.app_id,
-                history,
-            )
+        # Handle streaming vs non-streaming responses
+        if request.stream_response:
+            # For streaming responses, unpack the tuple
+            response_stream, sources = result
 
-        return response
+            async def generate_stream():
+                full_content = ""
+                first_token_time = None
+
+                async for chunk in response_stream:
+                    # Track time to first token
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        completion_start_to_first_token = first_token_time - perf.start_time
+                        perf.add_suboperation("completion_start_to_first_token", completion_start_to_first_token)
+                        logger.info(f"Completion start to first token: {completion_start_to_first_token:.2f}s")
+
+                    full_content += chunk
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+                # Convert sources to the format expected by frontend
+                sources_info = [
+                    {"document_id": source.document_id, "chunk_number": source.chunk_number, "score": source.score}
+                    for source in sources
+                ]
+
+                # Send completion signal with sources
+                yield f"data: {json.dumps({'done': True, 'sources': sources_info})}\n\n"
+
+                # Handle chat history after streaming is complete
+                if history_key:
+                    history.append(
+                        {
+                            "role": "assistant",
+                            "content": full_content,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                        }
+                    )
+                    await redis.set(history_key, json.dumps(history))
+                    await document_service.db.upsert_chat_history(
+                        request.chat_id,
+                        auth.user_id,
+                        auth.app_id,
+                        history,
+                    )
+
+                # Log consolidated performance summary for streaming
+                streaming_time = time.time() - first_token_time if first_token_time else 0
+                perf.add_suboperation("streaming_duration", streaming_time)
+                perf.log_summary(f"Generated streaming completion with {len(sources)} sources")
+
+            headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+            return StreamingResponse(generate_stream(), media_type="text/event-stream", headers=headers)
+        else:
+            # For non-streaming responses, result is just the CompletionResponse
+            response = result
+
+            # Chat history storage for non-streaming responses
+            perf.start_phase("chat_history_storage")
+            if history_key:
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": response.completion,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
+                )
+                await redis.set(history_key, json.dumps(history))
+                await document_service.db.upsert_chat_history(
+                    request.chat_id,
+                    auth.user_id,
+                    auth.app_id,
+                    history,
+                )
+
+            # Log consolidated performance summary
+            perf.log_summary(f"Generated completion with {len(response.sources) if response.sources else 0} sources")
+
+            return response
     except ValueError as e:
         validate_prompt_overrides_with_http_exception(operation_type="query", error=e)
     except PermissionError as e:
@@ -431,21 +630,75 @@ async def get_chat_history(
 
 @app.post("/agent", response_model=Dict[str, Any])
 @telemetry.track(operation_type="agent_query")
-async def agent_query(request: AgentQueryRequest, auth: AuthContext = Depends(verify_token)):
+async def agent_query(
+    request: AgentQueryRequest,
+    auth: AuthContext = Depends(verify_token),
+    redis: arq.ArqRedis = Depends(get_redis_pool),
+):
     """Execute an agent-style query using the :class:`MorphikAgent`.
 
     Args:
-        request: The query payload containing the natural language question.
+        request: The query payload containing the natural language question and optional chat_id.
         auth: Authentication context used to enforce limits and access control.
+        redis: Redis connection for chat history storage.
 
     Returns:
         A dictionary with the agent's full response.
     """
+    # Chat history retrieval
+    history_key = None
+    history: List[Dict[str, Any]] = []
+    if request.chat_id:
+        history_key = f"chat:{request.chat_id}"
+        stored = await redis.get(history_key)
+        if stored:
+            try:
+                history = json.loads(stored)
+            except Exception:
+                history = []
+        else:
+            db_hist = await document_service.db.get_chat_history(request.chat_id, auth.user_id, auth.app_id)
+            if db_hist:
+                history = db_hist
+
+        history.append(
+            {
+                "role": "user",
+                "content": request.query,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
     # Check free-tier agent call limits in cloud mode
     if settings.MODE == "cloud" and auth.user_id:
         await check_and_increment_limits(auth, "agent", 1)
+
     # Use the shared MorphikAgent instance; per-run state is now isolated internally
-    response = await morphik_agent.run(request.query, auth)
+    response = await morphik_agent.run(request.query, auth, history)
+
+    # Chat history storage
+    if history_key:
+        # Store the full agent response with structured data
+        agent_message = {
+            "role": "assistant",
+            "content": response.get("response", ""),
+            "timestamp": datetime.now(UTC).isoformat(),
+            # Store agent-specific structured data
+            "agent_data": {
+                "display_objects": response.get("display_objects", []),
+                "tool_history": response.get("tool_history", []),
+                "sources": response.get("sources", []),
+            },
+        }
+        history.append(agent_message)
+        await redis.set(history_key, json.dumps(history))
+        await document_service.db.upsert_chat_history(
+            request.chat_id,
+            auth.user_id,
+            auth.app_id,
+            history,
+        )
+
     # Return the complete response dictionary
     return response
 
@@ -456,7 +709,7 @@ async def list_documents(
     skip: int = 0,
     limit: int = 10000,
     filters: Optional[Dict[str, Any]] = None,
-    folder_name: Optional[Union[str, List[str]]] = None,
+    folder_name: Optional[Union[str, List[str]]] = Query(None),
     end_user_id: Optional[str] = None,
 ):
     """
@@ -475,8 +728,11 @@ async def list_documents(
     """
     # Create system filters for folder and user scoping
     system_filters = {}
-    if folder_name:
-        system_filters["folder_name"] = folder_name
+
+    # Normalize folder_name parameter (convert string "null" to None)
+    if folder_name is not None:
+        normalized_folder_name = normalize_folder_name(folder_name)
+        system_filters["folder_name"] = normalized_folder_name
     if end_user_id:
         system_filters["end_user_id"] = end_user_id
     if auth.app_id:
@@ -596,8 +852,9 @@ async def get_document_by_filename(
     try:
         # Create system filters for folder and user scoping
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
 
@@ -981,10 +1238,15 @@ async def create_graph(
         # Build system filters
         # --------------------
         system_filters: Dict[str, Any] = {}
-        if request.folder_name:
-            system_filters["folder_name"] = request.folder_name
+        if request.folder_name is not None:
+            normalized_folder_name = normalize_folder_name(request.folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if request.end_user_id:
             system_filters["end_user_id"] = request.end_user_id
+
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         # --------------------
         # Create stub graph
@@ -1319,10 +1581,15 @@ async def get_graph(
     try:
         # Create system filters for folder and user scoping
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
+
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         graph = await document_service.db.get_graph(name, auth, system_filters)
         if not graph:
@@ -1357,15 +1624,57 @@ async def list_graphs(
     try:
         # Create system filters for folder and user scoping
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
+
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         return await document_service.db.list_graphs(auth, system_filters)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graph/{name}/visualization", response_model=Dict[str, Any])
+@telemetry.track(operation_type="get_graph_visualization", metadata_resolver=telemetry.get_graph_metadata)
+async def get_graph_visualization(
+    name: str,
+    auth: AuthContext = Depends(verify_token),
+    folder_name: Optional[Union[str, List[str]]] = None,
+    end_user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Get graph visualization data.
+
+    This endpoint retrieves the nodes and links data needed for graph visualization.
+    It works with both local and API-based graph services.
+
+    Args:
+        name: Name of the graph to visualize
+        auth: Authentication context
+        folder_name: Optional folder to scope the operation to
+        end_user_id: Optional end-user ID to scope the operation to
+
+    Returns:
+        Dict: Visualization data containing nodes and links arrays
+    """
+    try:
+        return await document_service.get_graph_visualization_data(
+            name=name,
+            auth=auth,
+            folder_name=folder_name,
+            end_user_id=end_user_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error getting graph visualization data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1408,6 +1717,10 @@ async def update_graph(
         if request.end_user_id:
             system_filters["end_user_id"] = request.end_user_id
 
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
         return await document_service.update_graph(
             name=name,
             auth=auth,
@@ -1422,6 +1735,67 @@ async def update_graph(
         validate_prompt_overrides_with_http_exception(operation_type="graph", error=e)
     except Exception as e:
         logger.error(f"Error updating graph: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graph/workflow/{workflow_id}/status", response_model=Dict[str, Any])
+@telemetry.track(operation_type="check_workflow_status", metadata_resolver=telemetry.workflow_status_metadata)
+async def check_workflow_status(
+    workflow_id: str,
+    run_id: Optional[str] = None,
+    auth: AuthContext = Depends(verify_token),
+) -> Dict[str, Any]:
+    """Check the status of a graph build/update workflow.
+
+    This endpoint polls the external graph API to check the status of an async operation.
+
+    Args:
+        workflow_id: The workflow ID returned from build/update operations
+        run_id: Optional run ID for the specific workflow run
+        auth: Authentication context
+
+    Returns:
+        Dict containing status ('running', 'completed', or 'failed') and optional result
+    """
+    try:
+        # Get the graph service (either local or API-based)
+        graph_service = document_service.graph_service
+
+        # Check if it's the MorphikGraphService
+        from core.services.morphik_graph_service import MorphikGraphService
+
+        if isinstance(graph_service, MorphikGraphService):
+            # Use the new check_workflow_status method
+            result = await graph_service.check_workflow_status(workflow_id=workflow_id, run_id=run_id, auth=auth)
+
+            # If the workflow is completed, update the corresponding graph status
+            if result.get("status") == "completed":
+                # Extract graph_id from workflow_id (format: "build-update-{graph_name}-...")
+                # This is a simple heuristic, adjust based on actual workflow_id format
+                parts = workflow_id.split("-")
+                if len(parts) >= 3:
+                    graph_name = parts[2]
+                    try:
+                        # Find and update the graph
+                        graphs = await document_service.db.list_graphs(auth)
+                        for graph in graphs:
+                            if graph.name == graph_name or workflow_id in graph.system_metadata.get("workflow_id", ""):
+                                graph.system_metadata["status"] = "completed"
+                                # Clear workflow tracking data
+                                graph.system_metadata.pop("workflow_id", None)
+                                graph.system_metadata.pop("run_id", None)
+                                await document_service.db.update_graph(graph)
+                                break
+                    except Exception as e:
+                        logger.warning(f"Failed to update graph status after workflow completion: {e}")
+
+            return result
+        else:
+            # For local graph service, workflows complete synchronously
+            return {"status": "completed", "result": {"message": "Local graph operations complete synchronously"}}
+
+    except Exception as e:
+        logger.error(f"Error checking workflow status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1884,7 +2258,7 @@ async def list_chat_conversations(
 
     Args:
         auth: Authentication context containing user and app identifiers.
-        limit: Maximum number of conversations to return.
+        limit: Maximum number of conversations to return (1-500)
 
     Returns:
         A list of dictionaries describing each conversation, ordered by most

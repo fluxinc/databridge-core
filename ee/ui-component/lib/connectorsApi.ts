@@ -5,6 +5,31 @@ export interface ConnectorAuthStatus {
   auth_url?: string;
 }
 
+// Interface for manual credential fields
+export interface CredentialField {
+  name: string;
+  label: string;
+  description: string;
+  type: "text" | "password" | "select";
+  required: boolean;
+  options?: Array<{ value: string; label: string }>;
+}
+
+// Interface for manual credentials auth response
+export interface ManualAuthResponse {
+  auth_type: "manual_credentials";
+  required_fields: CredentialField[];
+  instructions?: string;
+}
+
+// Interface for OAuth auth response
+export interface OAuthAuthResponse {
+  authorization_url: string;
+}
+
+// Union type for auth responses
+export type AuthResponse = ManualAuthResponse | OAuthAuthResponse;
+
 // Fetches the authentication status for a given connector type
 export async function getConnectorAuthStatus(
   apiBaseUrl: string,
@@ -25,17 +50,15 @@ export async function getConnectorAuthStatus(
   return response.json();
 }
 
-// Initiates the authentication process by redirecting the user
-// The backend will handle the actual redirect to the OAuth provider
+// Updated function to handle both OAuth and manual credentials
 export async function initiateConnectorAuth(
   apiBaseUrl: string,
   connectorType: string,
   appRedirectUri: string,
   authToken: string | null
-): Promise<void> {
-  // Use the *initiate_url* helper which returns a JSON payload containing the
-  // provider's authorization_url.  This avoids CORS issues with opaque
-  // redirects when the backend directly issues a 30x to a third-party domain.
+): Promise<AuthResponse> {
+  // Use the *initiate_url* helper which returns a JSON payload containing either
+  // the provider's authorization_url (OAuth) or credential form specification (manual).
 
   const helperUrl = new URL(`${apiBaseUrl}/ee/connectors/${connectorType}/auth/initiate_url`);
   helperUrl.searchParams.append("app_redirect_uri", appRedirectUri);
@@ -63,17 +86,49 @@ export async function initiateConnectorAuth(
     }
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const data: { authorization_url: string } = await resp.json();
-    if (!data.authorization_url) {
-      throw new Error("Backend did not return authorization_url");
-    }
+    const data = await resp.json();
 
-    // Finally navigate to the provider's OAuth consent page
-    window.location.href = data.authorization_url;
+    // Check if this is a manual credentials flow or OAuth
+    if (data.auth_type === "manual_credentials") {
+      return data as ManualAuthResponse;
+    } else {
+      // OAuth flow - redirect to authorization URL
+      if (!data.authorization_url) {
+        throw new Error("Backend did not return authorization_url");
+      }
+      window.location.href = data.authorization_url;
+      return data as OAuthAuthResponse;
+    }
   } catch (err) {
     console.error("Error initiating connector auth:", err);
     throw err;
   }
+}
+
+// New function to submit manual credentials
+export async function submitManualCredentials(
+  apiBaseUrl: string,
+  connectorType: string,
+  credentials: Record<string, string>,
+  authToken: string | null
+): Promise<{ status: string; message: string }> {
+  const response = await fetch(`${apiBaseUrl}/ee/connectors/${connectorType}/auth/finalize`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+    },
+    body: JSON.stringify({ credentials }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      `Failed to submit credentials for ${connectorType}: ${response.status} ${response.statusText} - ${errorData.detail || ""}`
+    );
+  }
+
+  return response.json();
 }
 
 // Disconnects a connector for the current user

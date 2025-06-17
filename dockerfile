@@ -156,10 +156,11 @@ fi\n\
 # Function to check PostgreSQL\n\
 check_postgres() {\n\
     # Verify database connection\n\
-    if ! PGPASSWORD=$PGPASSWORD psql -h postgres -U $PGUSER -d $PGDATABASE -c "SELECT 1" > /dev/null 2>&1; then\n\
-        echo "Error: Could not connect to PostgreSQL database"\n\
-        exit 1\n\
-    fi\n\
+    echo "Waiting for PostgreSQL to be ready..."\n\
+    until PGPASSWORD=$PGPASSWORD psql -h postgres -U $PGUSER -d $PGDATABASE -c "SELECT 1" > /dev/null 2>&1; do\n\
+        echo "PostgreSQL is unavailable - sleeping"\n\
+        sleep 2\n\
+    done\n\
     echo "PostgreSQL connection verified!"\n\
 }\n\
 \n\

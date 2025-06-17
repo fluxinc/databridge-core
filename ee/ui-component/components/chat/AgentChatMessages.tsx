@@ -1,10 +1,13 @@
 import React, { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { PreviewMessage, UIMessage } from "./ChatMessages";
+import { Copy, Check } from "./icons";
 import ReactMarkdown from "react-markdown";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import remarkGfm from "remark-gfm";
+import Image from "next/image";
 
 // Add custom scrollbar styles
 const scrollbarStyles = `
@@ -26,6 +29,33 @@ const scrollbarStyles = `
     background-color: rgba(155, 155, 155, 0.7);
   }
 `;
+
+// Copy button component for agent messages
+function AgentCopyButton({ content }: { content: string }) {
+  const [copied, setCopied] = React.useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy text: ", err);
+    }
+  };
+
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-8 w-8 p-0"
+      onClick={handleCopy}
+      title={copied ? "Copied!" : "Copy message"}
+    >
+      {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+    </Button>
+  );
+}
 
 // Base interface for display objects
 export interface BaseDisplayObject {
@@ -235,18 +265,15 @@ const DisplayObjectRenderer: React.FC<{ object: DisplayObject; isInSourceView?: 
 
     return (
       <div className={isInSourceView ? "my-1" : "my-2"}>
-        <div className="overflow-hidden rounded-md">
-          <img
+        <div className="relative overflow-hidden rounded-md" style={{ width: "100%", height: "auto" }}>
+          <Image
             src={hasImagePrefix ? object.content : `data:image/png;base64,${object.content}`}
             alt={object.caption || "Image"}
+            layout="responsive"
+            width={500}
+            height={300}
+            objectFit="contain"
             className="h-auto max-w-full"
-            onError={event => {
-              // Correctly typed event parameter
-              const target = event.target as HTMLImageElement;
-              if (!hasImagePrefix && target.src.includes("image/png")) {
-                target.src = `data:image/jpeg;base64,${object.content}`;
-              }
-            }}
           />
         </div>
         {object.caption && <div className="mt-1 text-sm text-muted-foreground">{object.caption}</div>}
@@ -309,11 +336,18 @@ const SourcesRenderer: React.FC<{ sources: SourceObject[] }> = ({ sources }) => 
         const imageUrl = content.startsWith("data:image/") ? content : `data:image/png;base64,${content}`;
 
         return (
-          <div className="flex justify-center rounded-md bg-muted p-4">
-            <img
+          <div
+            className="relative flex justify-center rounded-md bg-muted p-4"
+            style={{ width: "100%", height: "auto" }}
+          >
+            <Image
               src={imageUrl}
               alt={`Image from ${source.documentName}`}
-              className="max-h-96 max-w-full object-contain"
+              layout="responsive"
+              width={500}
+              height={300}
+              objectFit="contain"
+              className="max-h-96 max-w-full"
             />
           </div>
         );
@@ -401,13 +435,22 @@ export function AgentPreviewMessage({ message }: AgentMessageProps) {
     return <PreviewMessage message={message} />;
   }
 
+  // Combine all text content from display objects for copying
+  const fullContent = displayObjects
+    .filter(obj => obj.type === "text")
+    .map(obj => obj.content)
+    .join("\n\n");
+
   // Show only display objects for assistant messages that have them
   return (
     <div className="group relative flex px-4 py-3">
       <div className="flex w-full flex-col items-start">
         <div className="flex w-full max-w-3xl items-start gap-4">
           <div className="flex-1 space-y-2 overflow-hidden">
-            <div className="rounded-xl bg-muted p-4">
+            <div className="relative rounded-xl bg-muted p-4">
+              <div className="absolute right-2 top-2">
+                <AgentCopyButton content={fullContent} />
+              </div>
               <div className="space-y-3">
                 {displayObjects.map((obj, idx) => (
                   <DisplayObjectRenderer key={idx} object={obj} />

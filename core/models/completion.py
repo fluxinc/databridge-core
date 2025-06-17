@@ -32,9 +32,10 @@ class CompletionRequest(BaseModel):
     query: str
     context_chunks: List[str]
     max_tokens: Optional[int] = 1000
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = 0.3
     prompt_template: Optional[str] = None
     folder_name: Optional[str] = None
     end_user_id: Optional[str] = None
     schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = None
     chat_history: Optional[List[ChatMessage]] = None
+    stream_response: Optional[bool] = False

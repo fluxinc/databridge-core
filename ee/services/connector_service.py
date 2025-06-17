@@ -14,6 +14,7 @@ except ImportError:
 
 from .connectors.base_connector import BaseConnector
 from .connectors.google_drive_connector import GoogleDriveConnector
+from .connectors.zotero_connector import ZoteroConnector
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ class ConnectorService:
         logger.info(f"Getting connector of type '{connector_type}' for user '{self.user_identifier}'")
         if connector_type == "google_drive":
             return GoogleDriveConnector(user_morphik_id=self.user_identifier)
+        elif connector_type == "zotero":
+            return ZoteroConnector(user_morphik_id=self.user_identifier)
         # Add elif for other connectors here in the future
         else:
             logger.error(f"Unsupported connector type: {connector_type}")

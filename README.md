@@ -16,7 +16,9 @@
   <a href="https://morphik.ai/docs">Docs</a> - <a href="https://discord.gg/BwMtv3Zaju">Community</a> - <a href="https://morphik.ai/docs/blogs/gpt-vs-morphik-multimodal">Why Morphik?</a> - <a href="https://github.com/morphik-org/morphik-core/issues/new?assignees=&labels=bug&template=bug_report.md">Bug reports</a>
 </p>
 
-## Morphik is an alternative to traditional RAG for highly technical and visual documents.
+> **Migration Required for Existing Installations**: If you installed Morphik before June 8, 2025, our most recent changes affect the way content is stored in the multivector chunks. Please run the `scripts/migrate_multivector_to_external_storage.py` script before launching Morphik.
+
+## Morphik is an open-source AI-native knowledge base.
 
 [Morphik](https://morphik.ai) provides developers the tools to ingest, search (deep and shallow), transform, and manage unstructured and multimodal documents. Some of our features include:
 
@@ -47,7 +49,7 @@ If you'd like to self-host Morphik, you can find the dedicated instruction [here
 
 ## Using Morphik
 
-Once you've signed up for Morphik, you can get started with ingesting and search your data right away.
+Once you've signed up for Morphik, you can get started with ingesting and searching your data right away.
 
 
 ### Code (Example: Python SDK)

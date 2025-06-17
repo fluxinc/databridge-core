@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Union
 
 import httpx
 
@@ -38,15 +38,27 @@ class MorphikGraphService:
         endpoint: str,
         auth: AuthContext,  # auth is passed for context, actual token extraction TBD
         json_data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.graph_api_key}"}
 
         url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
 
-        async with httpx.AsyncClient() as client:
+        # Set default timeout based on endpoint type
+        if timeout is None:
+            if "visualization" in endpoint:
+                timeout = 1200.0  # 20 minutes for visualization requests
+            else:
+                timeout = 300.0  # 5 minutes for other requests
+
+        timeout_config = httpx.Timeout(timeout)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             try:
-                logger.debug(f"Making API request: {method} {url} Data: {json_data}")
-                response = await client.request(method, url, json=json_data, headers=headers)
+                logger.debug(
+                    f"Making API request: {method} {url} Data: {json_data} Params: {params} Timeout: {timeout}s"
+                )
+                response = await client.request(method, url, json=json_data, headers=headers, params=params)
                 response.raise_for_status()  # Raise an exception for HTTP error codes (4xx or 5xx)
 
                 if response.status_code == 204:  # No Content
@@ -235,7 +247,18 @@ class MorphikGraphService:
                 json_data=request_data,
             )
             logger.info(f"Graph build API call for graph_id {graph.id} successful. Response: {api_response}")
-            graph.system_metadata["status"] = "completed"
+
+            # Check if the response contains workflow_id and run_id (async API)
+            if isinstance(api_response, dict) and "workflow_id" in api_response and "run_id" in api_response:
+                logger.info(
+                    f"Graph build is async. workflow_id: {api_response['workflow_id']}, run_id: {api_response['run_id']}"
+                )
+                graph.system_metadata["status"] = "processing"
+                graph.system_metadata["workflow_id"] = api_response["workflow_id"]
+                graph.system_metadata["run_id"] = api_response["run_id"]
+            else:
+                # Legacy synchronous response - mark as completed
+                graph.system_metadata["status"] = "completed"
         except Exception as e:
             logger.error(f"Failed to call graph build API for graph_id {graph.id}: {e}")
             graph.system_metadata["status"] = "build_api_failed"
@@ -302,11 +325,23 @@ class MorphikGraphService:
                     json_data=request_data,
                 )
                 logger.info(f"Graph update API call for graph_id {graph.id} successful. Response: {api_response}")
+
+                # Check if the response contains workflow_id and run_id (async API)
+                if isinstance(api_response, dict) and "workflow_id" in api_response and "run_id" in api_response:
+                    logger.info(
+                        f"Graph update is async. workflow_id: {api_response['workflow_id']}, run_id: {api_response['run_id']}"
+                    )
+                    graph.system_metadata["status"] = "processing"
+                    graph.system_metadata["workflow_id"] = api_response["workflow_id"]
+                    graph.system_metadata["run_id"] = api_response["run_id"]
+                else:
+                    # Legacy synchronous response - mark as completed
+                    graph.system_metadata["status"] = "completed"
+
                 # Update local graph object with new document IDs
                 current_doc_ids = set(graph.document_ids)
                 current_doc_ids.update(new_doc_ids_set)
                 graph.document_ids = list(current_doc_ids)
-                graph.system_metadata["status"] = "completed"
             except Exception as e:
                 logger.error(f"Failed to call graph update API for graph_id {graph.id}: {e}")
                 graph.system_metadata["status"] = "update_api_failed"
@@ -374,6 +409,109 @@ class MorphikGraphService:
             # Depending on requirements, either re-raise or return an error message / empty string
             raise  # Re-raise the exception to be handled by the caller
 
+    async def get_graph_visualization_data(
+        self,
+        graph_name: str,
+        auth: AuthContext,
+        system_filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Get graph visualization data from the external graph API.
+
+        Args:
+            graph_name: Name of the graph to visualize
+            auth: Authentication context
+            system_filters: Optional system filters for graph retrieval
+
+        Returns:
+            Dict containing nodes and links for visualization
+        """
+        graph = await self._find_graph(graph_name, auth, system_filters)
+        graph_id = graph.id
+
+        request_data = {"graph_id": graph_id}
+        try:
+            logger.info(
+                f"Requesting visualization data for graph_id {graph_id} (may take up to 2 minutes for large graphs)"
+            )
+            api_response = await self._make_api_request(
+                method="POST",
+                endpoint="/visualization",
+                auth=auth,
+                json_data=request_data,
+            )
+            logger.info(f"Visualization API call for graph_id {graph_id} successful.")
+
+            # The API should return a structure like:
+            # {
+            #   "nodes": [{"id": "...", "label": "...", "type": "...", "properties": {...}}, ...],
+            #   "links": [{"source": "...", "target": "...", "type": "..."}, ...]
+            # }
+
+            if isinstance(api_response, dict):
+                # Ensure we have the expected structure
+                nodes = api_response.get("nodes", [])
+                links = api_response.get("links", [])
+
+                # Transform to match the expected format for the UI
+                formatted_nodes = []
+                for node in nodes:
+                    formatted_nodes.append(
+                        {
+                            "id": node.get("id", ""),
+                            "label": node.get("label", ""),
+                            "type": node.get("type", "unknown"),
+                            "properties": node.get("properties", {}),
+                            "color": self._get_node_color(node.get("type", "unknown")),
+                        }
+                    )
+
+                formatted_links = []
+                for link in links:
+                    formatted_links.append(
+                        {
+                            "source": link.get("source", ""),
+                            "target": link.get("target", ""),
+                            "type": link.get("type", ""),
+                        }
+                    )
+
+                return {"nodes": formatted_nodes, "links": formatted_links}
+            else:
+                logger.warning(f"Unexpected response format from visualization API: {type(api_response)}")
+                return {"nodes": [], "links": []}
+
+        except Exception as e:
+            logger.error(f"Failed to call visualization API for graph_id {graph_id}: {e}")
+            # Check if this is a timeout error specifically
+            if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+                logger.warning(
+                    f"Visualization API timed out for graph_id {graph_id}. The graph may be large and still processing."
+                )
+                # For timeout errors, we could either:
+                # 1. Return empty data with a warning (current behavior)
+                # 2. Raise the exception to let the UI handle it
+                # For now, keeping the existing behavior but adding better logging
+            # Return empty visualization data on error
+            return {"nodes": [], "links": []}
+
+    def _get_node_color(self, node_type: str) -> str:
+        """Get color for a node type to match the UI color scheme."""
+        color_map = {
+            "person": "#4f46e5",  # Indigo
+            "organization": "#06b6d4",  # Cyan
+            "location": "#10b981",  # Emerald
+            "date": "#f59e0b",  # Amber
+            "concept": "#8b5cf6",  # Violet
+            "event": "#ec4899",  # Pink
+            "product": "#ef4444",  # Red
+            "entity": "#4f46e5",  # Indigo (for generic entities)
+            "attribute": "#f59e0b",  # Amber
+            "relationship": "#ec4899",  # Pink
+            "high_level_element": "#10b981",  # Emerald
+            "semantic_unit": "#8b5cf6",  # Violet
+        }
+        return color_map.get(node_type.lower(), "#6b7280")  # Gray as default
+
     async def query_with_graph(
         self,
         query: str,
@@ -391,7 +529,10 @@ class MorphikGraphService:
         system_filters: Optional[Dict[str, Any]] = None,  # For graph retrieval in self.retrieve
         folder_name: Optional[Union[str, List[str]]] = None,  # For document_service and CompletionRequest
         end_user_id: Optional[str] = None,  # For document_service and CompletionRequest
-    ) -> CompletionResponse:
+        hop_depth: Optional[int] = None,  # maintain signature
+        include_paths: Optional[bool] = None,  # maintain signature
+        stream_response: Optional[bool] = False,  # Add stream_response parameter
+    ) -> Union[CompletionResponse, tuple[AsyncGenerator[str, None], List[ChunkSource]]]:
         """Generate completion using combined context from an external graph API and standard document retrieval.
 
         1. Retrieves a context string from the external graph API via /retrieval.
@@ -414,9 +555,10 @@ class MorphikGraphService:
             system_filters: System filters for retrieving the graph for external API.
             folder_name: Folder name for scoping standard retrieval and completion.
             end_user_id: End user ID for scoping standard retrieval and completion.
+            stream_response: Whether to return a streaming response.
 
         Returns:
-            CompletionResponse: The generated completion response.
+            CompletionResponse or tuple of (AsyncGenerator, List[ChunkSource]) for streaming.
         """
         graph_api_context_str = ""
         try:
@@ -507,18 +649,23 @@ class MorphikGraphService:
             prompt_template=custom_prompt_template,
             folder_name=folder_name,
             end_user_id=end_user_id,
+            stream_response=stream_response,
         )
 
         try:
             response = await self.completion_model.complete(completion_req)
         except Exception as e:
             logger.error(f"Error during completion generation: {e}")
-            return CompletionResponse(text="", error=f"Failed to generate completion: {e}")
+            if stream_response:
+                # Return empty stream and sources for error case
+                async def empty_stream():
+                    yield ""
 
-        # Add sources information from the standard_chunks_results
-        if hasattr(response, "sources") and response.sources is None:
-            response.sources = []  # Ensure sources is a list if None
+                return (empty_stream(), [])
+            else:
+                return CompletionResponse(text="", error=f"Failed to generate completion: {e}")
 
+        # Prepare sources from standard chunks
         response_sources = [
             ChunkSource(
                 document_id=chunk.document_id,
@@ -527,16 +674,64 @@ class MorphikGraphService:
             )
             for chunk in standard_chunks_results
         ]
-        # If response already has sources, this will overwrite. If it should append, logic needs change.
-        response.sources = response_sources
 
-        # Add metadata about retrieval
-        if not hasattr(response, "metadata") or response.metadata is None:
-            response.metadata = {}
+        # Handle streaming vs non-streaming responses
+        if stream_response:
+            # For streaming, response should be an async generator
+            return (response, response_sources)
+        else:
+            # Add sources information from the standard_chunks_results
+            if hasattr(response, "sources") and response.sources is None:
+                response.sources = []  # Ensure sources is a list if None
 
-        response.metadata["retrieval_info"] = {
-            "graph_api_context_used": bool(graph_api_context_str and graph_api_context_str.strip()),
-            "standard_chunks_retrieved": len(standard_chunks_results),
-        }
+            # If response already has sources, this will overwrite. If it should append, logic needs change.
+            response.sources = response_sources
 
-        return response
+            # Add metadata about retrieval
+            if not hasattr(response, "metadata") or response.metadata is None:
+                response.metadata = {}
+
+            response.metadata["retrieval_info"] = {
+                "graph_api_context_used": bool(graph_api_context_str and graph_api_context_str.strip()),
+                "standard_chunks_retrieved": len(standard_chunks_results),
+            }
+
+            return response
+
+    async def check_workflow_status(
+        self,
+        workflow_id: str,
+        run_id: Optional[str] = None,
+        auth: AuthContext = None,
+    ) -> Dict[str, Any]:
+        """Check the status of a workflow from the graph API.
+
+        Args:
+            workflow_id: The workflow ID to check
+            run_id: Optional run ID for the specific workflow run
+            auth: Authentication context
+
+        Returns:
+            Dict containing status and optional result
+        """
+        try:
+            # Build query params
+            params = {}
+            if run_id:
+                params["run_id"] = run_id
+
+            api_response = await self._make_api_request(
+                method="GET",
+                endpoint=f"/status/{workflow_id}",
+                auth=auth,
+                json_data=None,  # GET request, no body
+                params=params,
+            )
+
+            logger.info(f"Workflow status check for {workflow_id} successful. Response: {api_response}")
+            return api_response
+
+        except Exception as e:
+            logger.error(f"Failed to check workflow status for {workflow_id}: {e}")
+            # Return failed status instead of raising
+            return {"status": "failed", "error": str(e)}

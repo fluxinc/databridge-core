@@ -1,14 +1,53 @@
+import type { UIMessage } from "./chat/ChatMessages";
+
+// Define option types used in callbacks
+export interface SearchOptions {
+  k?: number;
+  min_score?: number;
+  filters?: string | object; // JSON string or object with external_id array
+  use_reranking?: boolean;
+  use_colpali?: boolean;
+}
+
+export interface QueryOptions extends SearchOptions {
+  max_tokens?: number;
+  temperature?: number;
+  graph_name?: string;
+  folder_name?: string | string[]; // Support single folder or array of folders
+  // external_id removed - should be in filters object as external_id: string[]
+}
+
 // Common types used across multiple components
 
 export interface MorphikUIProps {
-  connectionUri?: string;
+  connectionUri?: string | null; // Allow null/undefined initially
   apiBaseUrl?: string;
   isReadOnlyUri?: boolean; // Controls whether the URI can be edited
-  onUriChange?: (uri: string) => void; // Callback when URI is changed
+  onUriChange?: (newUri: string) => void; // Callback when URI is changed
   onBackClick?: () => void; // Callback when back button is clicked
   appName?: string; // Name of the app to display in UI
   initialFolder?: string | null; // Initial folder to show
-  initialSection?: string; // Initial section to show (documents, search, chat, etc.)
+  initialSection?: "documents" | "search" | "chat" | "graphs" | "connections"; // Initial section to show
+
+  // Callbacks for Documents Section tracking
+  onDocumentUpload?: (fileName: string, fileSize: number) => void;
+  onDocumentDelete?: (fileName: string) => void;
+  onDocumentClick?: (fileName: string) => void;
+  onFolderCreate?: (folderName: string) => void;
+  onFolderDelete?: (folderName: string) => void;
+  onFolderClick?: (folderName: string | null) => void; // Allow null
+
+  // Callbacks for Search and Chat tracking
+  onSearchSubmit?: (query: string, options: SearchOptions) => void;
+  onChatSubmit?: (query: string, options: QueryOptions, initialMessages?: UIMessage[]) => void; // Use UIMessage[]
+
+  // Callback for Agent Chat tracking
+  onAgentSubmit?: (query: string) => void;
+
+  // Callbacks for Graph tracking
+  onGraphClick?: (graphName: string | undefined) => void;
+  onGraphCreate?: (graphName: string, numDocuments: number) => void;
+  onGraphUpdate?: (graphName: string, numAdditionalDocuments: number) => void;
 }
 
 export interface Document {
@@ -54,22 +93,8 @@ export interface Source {
 }
 
 export interface ChatMessage {
-  role: 'user' | 'assistant';
+  role: "user" | "assistant";
   content: string;
+  timestamp?: string;
   sources?: Source[];
-}
-
-export interface SearchOptions {
-  filters: string;
-  k: number;
-  min_score: number;
-  use_reranking: boolean;
-  use_colpali: boolean;
-  folder_name?: string;
-}
-
-export interface QueryOptions extends SearchOptions {
-  max_tokens: number;
-  temperature: number;
-  graph_name?: string;
 }

@@ -1,20 +1,24 @@
 import asyncio
 import json
 import logging
+import os
+import sys
+import uuid  # , override
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Dict
 
 import filetype
 import jwt
 import pydantic
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from dotenv import load_dotenv
+from httpx import AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from core.api import get_settings
+from core.config import get_settings
 from core.models.prompts import EntityExtractionPromptOverride, EntityResolutionPromptOverride, GraphPromptOverrides
 from core.tests import setup_test_logging
 
@@ -22,12 +26,39 @@ from core.tests import setup_test_logging
 setup_test_logging()
 logger = logging.getLogger(__name__)
 
+load_dotenv(override=True)
+
+# Get settings from the server configuration
+settings = get_settings()
 
 # Test configuration
 TEST_DATA_DIR = Path(__file__).parent / "test_data"
-JWT_SECRET = "your-secret-key-for-signing-tokens"
 TEST_USER_ID = "test_user"
-TEST_POSTGRES_URI = "postgresql+asyncpg://databridge@localhost:5432/databridge_test"
+TEST_SERVER_URL = os.getenv("TEST_SERVER_URL", "http://localhost:8000")
+
+
+def confirm_test_database():
+    """Confirm that we're using a test database before running tests."""
+    expected_test_uri = "postgresql+asyncpg://morphik@localhost:5432/morphik_test"
+    actual_uri = settings.POSTGRES_URI
+
+    if not actual_uri:
+        logger.critical("POSTGRES_URI not set in .env file! Tests aborted to prevent accidental data loss.")
+        logger.critical("Please configure a test database before running integration tests.")
+        sys.exit(1)
+    elif expected_test_uri != actual_uri:
+        logger.critical("POSTGRES_URI is not set to the expected test database!")
+        logger.critical(f"Expected: {expected_test_uri}")
+        logger.critical(f"Actual: {actual_uri}")
+        logger.critical("Tests aborted to prevent modifying production data.")
+        logger.critical("Please configure a test database before running integration tests.")
+        sys.exit(1)
+    else:
+        logger.info(f"Using test database: {actual_uri}")
+
+
+# Run the confirmation check when the module is loaded
+confirm_test_database()
 
 
 @pytest.fixture(scope="session")
@@ -78,7 +109,8 @@ def create_test_token(
     if app_id:
         payload["app_id"] = app_id
 
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    # Use JWT_SECRET_KEY from server settings instead of hardcoding
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm="HS256")
 
 
 def create_auth_header(
@@ -89,140 +121,40 @@ def create_auth_header(
     return {"Authorization": f"Bearer {token}"}
 
 
-@pytest.fixture
-async def test_app(event_loop: asyncio.AbstractEventLoop) -> FastAPI:
-    """Create test FastAPI application"""
-    # Configure test settings
-    settings = get_settings()
-    settings.JWT_SECRET_KEY = JWT_SECRET
-
-    # Override database settings to use test database
-    # This ensures we don't use the production database from .env
-    settings.POSTGRES_URI = TEST_POSTGRES_URI
-    settings.DATABASE_PROVIDER = "postgres"  # Ensure we're using postgres
-
-    # IMPORTANT: We need to completely reinitialize the database connections
-    # since they were already established at import time
-
-    # First, get the database from the API module
-    from core.api import app
-    from core.api import database as api_database
-
-    # Close existing connection if it exists
-    if hasattr(api_database, "engine"):
-        await api_database.engine.dispose()
-
-    # Create a new database connection with the test URI
-    from core.database.postgres_database import PostgresDatabase
-
-    test_database = PostgresDatabase(uri=TEST_POSTGRES_URI)
-
-    # Initialize the test database
-    await test_database.initialize()
-
-    # Replace the global database instance with our test database
-    import core.api
-
-    core.api.database = test_database
-
-    # Also update the vector store if it uses the same database (for pgvector)
-    if settings.VECTOR_STORE_PROVIDER == "pgvector":
-        from core.vector_store.pgvector_store import PGVectorStore
-
-        # Create a new vector store with the test URI
-        test_vector_store = PGVectorStore(uri=TEST_POSTGRES_URI)
-
-        # Initialize the vector store database
-        await test_vector_store.initialize()
-
-        # Replace the global vector store with our test version
-        core.api.vector_store = test_vector_store
-
-    # Initialize Redis connection pool for testing
-    import arq.connections
-
-    from core.workers.ingestion_worker import redis_settings_from_env
-
-    # Create a Redis connection pool
-    logger.info("Creating Redis connection pool for tests")
-    try:
-        redis_settings = redis_settings_from_env()
-        redis_pool = await arq.create_pool(redis_settings)
-        # Replace the global redis_pool with our test version
-        core.api.redis_pool = redis_pool
-        logger.info("Redis connection pool created successfully for tests")
-    except Exception as e:
-        logger.error(f"Failed to create Redis connection pool for tests: {str(e)}")
-        # Continue without Redis to allow other tests to run
-
-    # Update the document service with our test instances
-    # Create a new document service with our test database and vector store
-    from core.api import (
-        cache_factory,
-        colpali_embedding_model,
-        colpali_vector_store,
-        completion_model,
-        embedding_model,
-        parser,
-        reranker,
-        storage,
-    )
-    from core.services.document_service import DocumentService
-
-    test_document_service = DocumentService(
-        database=test_database,
-        vector_store=core.api.vector_store,
-        parser=parser,
-        embedding_model=embedding_model,
-        completion_model=completion_model,
-        cache_factory=cache_factory,
-        reranker=reranker,
-        storage=storage,
-        enable_colpali=settings.ENABLE_COLPALI,
-        colpali_embedding_model=colpali_embedding_model,
-        colpali_vector_store=colpali_vector_store,
-    )
-
-    # Replace the global document service with our test version
-    core.api.document_service = test_document_service
-
-    # Update the graph service if needed
-    if hasattr(core.api, "graph_service"):
-        from core.api import completion_model
-        from core.services.graph_service import GraphService
-
-        test_graph_service = GraphService(
-            db=test_database, embedding_model=embedding_model, completion_model=completion_model
-        )
-
-        core.api.graph_service = test_graph_service
-
-    return app
-
-
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="function", autouse=True)
 async def cleanup_redis():
-    """Clean up Redis connection pool after tests"""
+    """Placeholder for Redis cleanup - modified for external server"""
     yield
-    # This will run after each test function
-    import core.api
-
-    if hasattr(core.api, "redis_pool") and core.api.redis_pool:
-        logger.info("Closing Redis connection pool after test")
-        try:
-            core.api.redis_pool.close()
-            await core.api.redis_pool.wait_closed()
-            logger.info("Redis connection pool closed successfully")
-        except Exception as e:
-            logger.error(f"Failed to close Redis connection pool: {str(e)}")
+    # We no longer directly control the Redis connection in tests
+    # as we're using an external server
 
 
 @pytest.fixture
-async def client(
-    test_app: FastAPI, event_loop: asyncio.AbstractEventLoop, cleanup_redis
-) -> AsyncGenerator[AsyncClient, None]:
-    """Create async test client"""
-    async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
+async def client(event_loop: asyncio.AbstractEventLoop, cleanup_redis) -> AsyncGenerator[AsyncClient, None]:
+    """Create async test client that connects to a running server"""
+    # Verify that the server is running
+    try:
+        async with AsyncClient(base_url=TEST_SERVER_URL, timeout=30.0) as check_client:
+            # First try the /ping endpoint
+            try:
+                response = await check_client.get(f"{TEST_SERVER_URL}/ping", timeout=5.0)
+                if response.status_code != 200:
+                    # If /ping fails, try the root endpoint
+                    response = await check_client.get(TEST_SERVER_URL, timeout=5.0)
+                    if response.status_code >= 400:
+                        logger.critical(f"Server at {TEST_SERVER_URL} is not responding properly. Tests will not run.")
+                        sys.exit(1)
+            except Exception:
+                # If /ping fails, try the root endpoint
+                response = await check_client.get(TEST_SERVER_URL, timeout=5.0)
+                if response.status_code >= 400:
+                    logger.critical(f"Server at {TEST_SERVER_URL} is not responding properly. Tests will not run.")
+                    sys.exit(1)
+    except Exception as e:
+        logger.critical(f"Server at {TEST_SERVER_URL} is not running. Tests will not run. Error: {e}")
+        sys.exit(1)
+
+    async with AsyncClient(base_url=TEST_SERVER_URL, timeout=30.0) as client:
         yield client
 
 
@@ -235,7 +167,12 @@ async def cleanup_documents():
 
     # We should always use the test database
     # Create a fresh connection to make sure we're not affected by any state
-    engine = create_async_engine(TEST_POSTGRES_URI)
+    postgres_uri = settings.POSTGRES_URI
+    if not postgres_uri:
+        logger.warning("POSTGRES_URI not set, skipping document cleanup")
+        return
+
+    engine = create_async_engine(postgres_uri)
 
     try:
         async with engine.begin() as conn:
@@ -247,6 +184,11 @@ async def cleanup_documents():
                 await conn.execute(text("DELETE FROM vector_embeddings"))
             except Exception as e:
                 logger.info(f"No chunks table to clean or error: {e}")
+
+            try:
+                await conn.execute(text("DELETE FROM chat_conversations"))
+            except Exception:
+                logger.info("No chat_conversations table to clean")
 
     except Exception as e:
         logger.error(f"Failed to clean up document tables: {e}")
@@ -408,21 +350,6 @@ async def test_ingest_invalid_metadata(client: AsyncClient):
             headers=headers,
         )
         assert response.status_code == 400  # Bad request
-
-
-# @pytest.mark.asyncio
-# @pytest.mark.skipif(
-#     get_settings().EMBEDDING_PROVIDER == "ollama",
-#     reason="local embedding models do not have size limits",
-# )
-# async def test_ingest_oversized_content(client: AsyncClient):
-#     """Test ingestion with oversized content"""
-#     headers = create_auth_header()
-#     large_content = "x" * (10 * 1024 * 1024)  # 10MB
-#     response = await client.post(
-#         "/ingest/text", json={"content": large_content, "metadata": {}}, headers=headers
-#     )
-#     assert response.status_code == 400  # Bad request
 
 
 @pytest.mark.asyncio
@@ -1610,54 +1537,52 @@ async def test_query_with_reranking(client: AsyncClient):
 
 @pytest.fixture(scope="function", autouse=True)
 async def cleanup_graphs():
-    """Clean up graphs before each graph test"""
+    """Clean up graphs before each graph test. Assumes 'graphs' table exists."""
     # Create a fresh connection to the test database
-    engine = create_async_engine(TEST_POSTGRES_URI)
+    postgres_uri = settings.POSTGRES_URI
+    if not postgres_uri:
+        logger.warning("POSTGRES_URI not set, skipping graph cleanup")
+        yield
+        return
+
+    engine = create_async_engine(postgres_uri)
     try:
         async with engine.begin() as conn:
-            # First check if the graphs table exists
+            # First check if the graphs table exists in the public schema
             result = await conn.execute(
                 text(
                     """
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_name = 'graphs'
-                );
-                """
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_name = 'graphs' AND table_schema = 'public'
+                    );
+                    """
                 )
             )
             table_exists = result.scalar()
 
             if table_exists:
-                # Only delete if the table exists
-                await conn.execute(text("DELETE FROM graphs"))
-                logger.info("Cleaned up all graph-related tables")
+                # If table exists, delete all rows from it
+                await conn.execute(text("DELETE FROM public.graphs"))
             else:
-                # Create the table if it doesn't exist
-                await conn.execute(
-                    text(
-                        """
-                        CREATE TABLE IF NOT EXISTS graphs (
-                            id VARCHAR PRIMARY KEY,
-                            name VARCHAR UNIQUE,
-                            entities JSONB DEFAULT '[]',
-                            relationships JSONB DEFAULT '[]',
-                            graph_metadata JSONB DEFAULT '{}',
-                            document_ids JSONB DEFAULT '[]',
-                            filters JSONB DEFAULT NULL,
-                            created_at VARCHAR,
-                            updated_at VARCHAR,
-                            owner JSONB DEFAULT '{}',
-                            access_control JSONB DEFAULT '{"readers": [], "writers": [], "admins": []}'
-                        );
-                        """
-                    )
+                # If table does not exist, this is a setup issue. Tests requiring it will fail.
+                # Log a critical error. Graph-related tests will likely fail.
+                # This fixture should not be responsible for creating schema.
+                logger.warning(
+                    "The 'public.graphs' table does not exist in test database. "
+                    "Graph-related tests will likely fail."
                 )
-                await conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_graph_name ON graphs(name);"""))
-                logger.info("Created graphs table as it did not exist")
+    except OperationalError as oe:  # Catch specific SQLAlchemy/DB driver operational errors
+        logger.error(
+            f"Operational error during graph cleanup/check: {oe}. "
+            "This might indicate a connection or DB setup issue (e.g., permissions, DB down)."
+        )
+        # Just log error but don't fail test, as we're working with external server
+        pass
     except Exception as e:
-        logger.error(f"Failed to clean up graph tables: {e}")
-        raise
+        logger.error(f"Unexpected error during graph cleanup: {e}")
+        # Just log error but don't fail test, as we're working with external server
+        pass
     finally:
         await engine.dispose()
 
@@ -1699,7 +1624,11 @@ async def test_create_graph(client: AsyncClient):
     )
 
     assert response.status_code == 200
-    graph = response.json()
+    # Wait for background processing to finish
+    await _wait_graph_completion(client, graph_name, headers)
+
+    graph_resp = await client.get(f"/graph/{graph_name}", headers=headers)
+    graph = graph_resp.json()
 
     # Verify graph structure
     assert graph["name"] == graph_name
@@ -3561,3 +3490,422 @@ async def test_prompt_override_placeholder_validation(client: AsyncClient):
     )
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_multi_folder_list_scoping(client: AsyncClient):
+    """Ensure endpoints correctly accept and enforce *multiple* folder names passed as a list."""
+    headers = create_auth_header()
+
+    # Create three distinct folders
+    folder1_name = "mf_folder1"
+    folder2_name = "mf_folder2"
+    folder_other = "mf_folder_other"
+
+    # Unique contents
+    content_phrase = "multi-folder-unique-phrase"
+    content1 = f"Document in {folder1_name} containing {content_phrase}."
+    content2 = f"Document in {folder2_name} also containing {content_phrase}."
+    other_content = "Document in other folder with different phrase."
+
+    # Ingest documents in the three folders (no end_user scope for simplicity)
+    doc1_id = await test_ingest_text_document_folder_user(
+        client,
+        content=content1,
+        metadata={"mf_test": True},
+        folder_name=folder1_name,
+        end_user_id=None,
+    )
+    doc2_id = await test_ingest_text_document_folder_user(
+        client,
+        content=content2,
+        metadata={"mf_test": True},
+        folder_name=folder2_name,
+        end_user_id=None,
+    )
+    doc_other_id = await test_ingest_text_document_folder_user(
+        client,
+        content=other_content,
+        metadata={"mf_test": True},
+        folder_name=folder_other,
+        end_user_id=None,
+    )
+
+    # Helper: wait until ingestion workers finish so system_metadata is fully committed
+    async def _wait_completion(document_id: str, max_tries: int = 10):
+        for _ in range(max_tries):
+            status_resp = await client.get(f"/documents/{document_id}/status", headers=headers)
+            if status_resp.status_code == 200 and status_resp.json().get("status") == "completed":
+                return
+            await asyncio.sleep(1)
+
+    await _wait_completion(doc1_id)
+    await _wait_completion(doc2_id)
+    await _wait_completion(doc_other_id)
+
+    # ------------ List documents endpoint (multiple folder_name query params) ------------
+    list_docs_url = "/documents"
+    response = await client.post(
+        list_docs_url, json={"mf_test": True, "folder_name": [folder1_name, folder2_name]}, headers=headers
+    )
+    assert response.status_code == 200
+    docs = response.json()
+    returned_ids = {d["external_id"] for d in docs}
+    assert doc1_id in returned_ids
+    assert doc2_id in returned_ids
+    assert doc_other_id not in returned_ids
+
+    # ------------ retrieve/docs with folder list ------------
+    response = await client.post(
+        "/retrieve/docs",
+        json={
+            "query": content_phrase,
+            "folder_name": [folder1_name, folder2_name],
+            "k": 5,
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    docs_results = response.json()
+    assert len(docs_results) > 0
+    assert all(r["document_id"] in {doc1_id, doc2_id} for r in docs_results)
+
+    # ------------ retrieve/chunks with folder list ------------
+    response = await client.post(
+        "/retrieve/chunks",
+        json={
+            "query": content_phrase,
+            "folder_name": [folder1_name, folder2_name],
+            "k": 5,
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    chunks = response.json()
+    assert len(chunks) > 0
+    assert all(c["document_id"] in {doc1_id, doc2_id} for c in chunks)
+
+    # ------------ batch/documents with folder list ------------
+    response = await client.post(
+        "/batch/documents",
+        json={
+            "document_ids": [doc1_id, doc2_id, doc_other_id],
+            "folder_name": [folder1_name, folder2_name],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    batch_docs = response.json()
+    returned_ids = {d["external_id"] for d in batch_docs}
+    assert returned_ids == {doc1_id, doc2_id}
+
+    # ------------ batch/chunks with folder list ------------
+    sources = [
+        {"document_id": doc1_id, "chunk_number": 0},
+        {"document_id": doc2_id, "chunk_number": 0},
+        {"document_id": doc_other_id, "chunk_number": 0},
+    ]
+    response = await client.post(
+        "/batch/chunks",
+        json={
+            "sources": sources,
+            "folder_name": [folder1_name, folder2_name],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    batch_chunks = response.json()
+    assert len(batch_chunks) > 0
+    assert all(ch["document_id"] in {doc1_id, doc2_id} for ch in batch_chunks)
+
+    # ------------ query endpoint with folder list ------------
+    response = await client.post(
+        "/query",
+        json={
+            "query": f"Which folder contains {content_phrase}?",
+            "folder_name": [folder1_name, folder2_name],
+            "k": 2,
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    result = response.json()
+    # Ensure sources are scoped correctly
+    assert "sources" in result and len(result["sources"]) > 0
+    assert all(src["document_id"] in {doc1_id, doc2_id} for src in result["sources"])
+
+
+@pytest.mark.asyncio
+async def test_documents_not_in_folder(client: AsyncClient):
+    """Test retrieving documents that are not in any folder (folder_name is null)."""
+    headers = create_auth_header()
+
+    # Ingest a document without a folder
+    no_folder_content = "This document is not in any folder"
+    doc_no_folder_id = await test_ingest_text_document(client, content=no_folder_content)
+
+    # Ingest a document with a folder
+    folder_name = "test_folder_for_null_check"
+    folder_content = "This document is in a folder"
+    doc_with_folder_id = await test_ingest_text_document_folder_user(
+        client,
+        content=folder_content,
+        metadata={"test": "value"},
+        folder_name=folder_name,
+        end_user_id=None,
+    )
+
+    # Wait a bit for ingestion to complete
+    await asyncio.sleep(2)
+
+    # Test listing documents not in any folder (folder_name=null)
+    response = await client.post("/documents", json={}, headers=headers, params={"folder_name": "null"})
+    assert response.status_code == 200
+    docs = response.json()
+
+    # Check that we get exactly our documents with null folder_name
+    found_doc_ids = {doc["external_id"] for doc in docs}
+
+    # The document without folder should be in the results
+    assert doc_no_folder_id in found_doc_ids, "Document without folder should be found when filtering by null folder"
+
+    # The document with folder should NOT be in the results
+    assert (
+        doc_with_folder_id not in found_doc_ids
+    ), "Document with folder should NOT be found when filtering by null folder"
+
+    # Verify the returned document has null folder_name
+    for doc in docs:
+        if doc["external_id"] == doc_no_folder_id:
+            assert doc["system_metadata"]["folder_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_documents_in_folder_or_no_folder(client: AsyncClient):
+    """Test retrieving documents either in a specific folder OR not in any folder."""
+    headers = create_auth_header()
+
+    # Ingest a document without a folder
+    no_folder_content = "Document with no folder"
+    doc_no_folder_id = await test_ingest_text_document(client, content=no_folder_content)
+
+    # Ingest a document in folder A
+    folder_a_name = "folder_a_for_mixed_test"
+    folder_a_content = "Document in folder A"
+    doc_folder_a_id = await test_ingest_text_document_folder_user(
+        client,
+        content=folder_a_content,
+        metadata={"test": "folder_a"},
+        folder_name=folder_a_name,
+        end_user_id=None,
+    )
+
+    # Ingest a document in folder B
+    folder_b_name = "folder_b_for_mixed_test"
+    folder_b_content = "Document in folder B"
+    doc_folder_b_id = await test_ingest_text_document_folder_user(
+        client,
+        content=folder_b_content,
+        metadata={"test": "folder_b"},
+        folder_name=folder_b_name,
+        end_user_id=None,
+    )
+
+    # Wait a bit for ingestion to complete
+    await asyncio.sleep(2)
+
+    # Test listing documents in folder A OR not in any folder
+    response = await client.post(
+        "/documents", json={}, headers=headers, params={"folder_name": [folder_a_name, "null"]}
+    )
+    assert response.status_code == 200
+    docs = response.json()
+
+    # Track which documents we found
+    found_doc_ids = {doc["external_id"] for doc in docs}
+
+    # Should find: doc_no_folder_id and doc_folder_a_id
+    # Should NOT find: doc_folder_b_id
+    assert doc_no_folder_id in found_doc_ids, "Document without folder should be found"
+    assert doc_folder_a_id in found_doc_ids, "Document in folder A should be found"
+    assert doc_folder_b_id not in found_doc_ids, "Document in folder B should NOT be found"
+
+    # Verify the folder_name values
+    for doc in docs:
+        if doc["external_id"] == doc_no_folder_id:
+            assert doc["system_metadata"]["folder_name"] is None
+        elif doc["external_id"] == doc_folder_a_id:
+            assert doc["system_metadata"]["folder_name"] == folder_a_name
+
+
+# ---------------------------------------------------------------------------
+# Utility – wait for background graph builds to complete
+# ---------------------------------------------------------------------------
+
+
+async def _wait_graph_completion(
+    client: AsyncClient,
+    graph_name: str,
+    headers: Dict[str, str],
+    folder_name: str | list[str] | None = None,
+    end_user_id: str | None = None,
+    max_tries: int = 30,
+):
+    """Poll /graph/{graph_name} until system_metadata.status == 'completed'."""
+    params: Dict[str, Any] = {}
+    if folder_name is not None:
+        params["folder_name"] = folder_name
+    if end_user_id is not None:
+        params["end_user_id"] = end_user_id
+
+    for _ in range(max_tries):
+        resp = await client.get(f"/graph/{graph_name}", headers=headers, params=params)
+        if resp.status_code == 200:
+            g = resp.json()
+            if g.get("system_metadata", {}).get("status") == "completed":
+                return g
+        await asyncio.sleep(1)
+    raise AssertionError(f"Graph {graph_name} did not complete within timeout")
+
+
+# ---------------------------------------------------------------------------
+# New tests – regression for PDF-named text & failed status propagation
+# ---------------------------------------------------------------------------
+
+
+async def _wait_doc_status(
+    client: AsyncClient, doc_id: str, headers: Dict[str, str], *, target: str, timeout: int = 30
+):
+    """Poll /documents/{id}/status until status matches *target* or timeout."""
+    import asyncio
+    import time
+
+    start = time.time()
+    while time.time() - start < timeout:
+        resp = await client.get(f"/documents/{doc_id}/status", headers=headers)
+        if resp.status_code == 200:
+            status = resp.json().get("status")
+            if status == target:
+                return resp.json()
+        await asyncio.sleep(1)
+    raise AssertionError(f"Document {doc_id} did not reach status={target} within {timeout}s")
+
+
+@pytest.mark.asyncio
+async def test_ingest_text_named_pdf_success(client: AsyncClient):
+    """Plain-text bytes with a .pdf name should still ingest successfully."""
+
+    headers = create_auth_header()
+
+    fake_pdf_bytes = b"This is actually plain text, not a PDF."
+
+    response = await client.post(
+        "/ingest/file",
+        files={"file": ("fake.pdf", fake_pdf_bytes, "text/plain")},
+        data={"metadata": json.dumps({"regression": "pdf_named_text"})},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    doc = response.json()
+
+    # Wait until worker completes (should be 'completed')
+    status_info = await _wait_doc_status(client, doc["external_id"], headers, target="completed")
+
+    assert status_info["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_ingest_empty_file_sets_failed_status(client: AsyncClient):
+    """Uploading an empty file should fail and status should become 'failed'."""
+
+    headers = create_auth_header()
+
+    empty_bytes = b""  # zero-length
+
+    response = await client.post(
+        "/ingest/file",
+        files={"file": ("empty.txt", empty_bytes, "text/plain")},
+        data={"metadata": json.dumps({"regression": "empty_file"})},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    doc = response.json()
+
+    # Wait for the worker to mark as failed
+    status_info = await _wait_doc_status(client, doc["external_id"], headers, target="failed")
+
+    assert status_info["status"] == "failed"
+    assert "error" in status_info and "No content chunks" in status_info["error"]
+
+
+@pytest.mark.asyncio
+async def test_chat_persistence(client: AsyncClient):
+    """Ensure chat history is persisted across queries."""
+    headers = create_auth_header()
+    chat_id = str(uuid.uuid4())
+
+    await test_ingest_text_document(client, content="Chat persistence doc")
+
+    resp1 = await client.post(
+        "/query",
+        json={"query": "first", "chat_id": chat_id},
+        headers=headers,
+    )
+    assert resp1.status_code == 200
+
+    resp2 = await client.post(
+        "/query",
+        json={"query": "second", "chat_id": chat_id},
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+
+    hist = await client.get(f"/chat/{chat_id}", headers=headers)
+    assert hist.status_code == 200
+    history = hist.json()
+    assert len(history) >= 4
+    assert history[0]["role"] == "user"
+    assert history[1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_persistence(client: AsyncClient):
+    """Ensure agent conversation history is persisted across queries."""
+    headers = create_auth_header()
+    chat_id = str(uuid.uuid4())
+
+    # First agent message
+    resp1 = await client.post(
+        "/agent",
+        json={"query": "Hello, my name is Bob", "chat_id": chat_id},
+        headers=headers,
+    )
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert "response" in data1
+
+    # Second agent message that references the first
+    resp2 = await client.post(
+        "/agent",
+        json={"query": "What is my name?", "chat_id": chat_id},
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert "response" in data2
+    # The agent should remember the name "Bob" from the conversation history
+    assert "Bob" in data2["response"] or "bob" in data2["response"].lower()
+
+    # Verify conversation history is stored
+    hist = await client.get(f"/chat/{chat_id}", headers=headers)
+    assert hist.status_code == 200
+    history = hist.json()
+    assert len(history) >= 4  # 2 user messages + 2 assistant responses
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "Hello, my name is Bob"
+    assert history[1]["role"] == "assistant"
+    assert history[2]["role"] == "user"
+    assert history[2]["content"] == "What is my name?"
+    assert history[3]["role"] == "assistant"

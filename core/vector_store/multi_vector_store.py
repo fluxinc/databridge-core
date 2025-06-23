@@ -1,18 +1,31 @@
+import asyncio
+import base64
+import json
 import logging
 import time
 from contextlib import contextmanager
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import psycopg
 import torch
 from pgvector.psycopg import Bit, register_vector
+from psycopg_pool import ConnectionPool
 
+from core.config import get_settings
 from core.models.chunk import DocumentChunk
+from core.storage.base_storage import BaseStorage
+from core.storage.local_storage import LocalStorage
+from core.storage.s3_storage import S3Storage
+from core.storage.utils_file_extensions import detect_file_type
 
 from .base_vector_store import BaseVectorStore
 
 logger = logging.getLogger(__name__)
+
+# Constants for external storage
+MULTIVECTOR_CHUNKS_BUCKET = "multivector-chunks"
+DEFAULT_APP_ID = "default"  # Fallback for local usage when app_id is None
 
 
 class MultiVectorStore(BaseVectorStore):
@@ -23,6 +36,8 @@ class MultiVectorStore(BaseVectorStore):
         uri: str,
         max_retries: int = 3,
         retry_delay: float = 1.0,
+        auto_initialize: bool = True,
+        enable_external_storage: bool = True,
     ):
         """Initialize PostgreSQL connection for multi-vector storage.
 
@@ -30,15 +45,58 @@ class MultiVectorStore(BaseVectorStore):
             uri: PostgreSQL connection URI
             max_retries: Maximum number of connection retry attempts
             retry_delay: Delay in seconds between retry attempts
+            auto_initialize: Whether to automatically initialize the store
+            enable_external_storage: Whether to use external storage for chunks
         """
         # Convert SQLAlchemy URI to psycopg format if needed
         if uri.startswith("postgresql+asyncpg://"):
             uri = uri.replace("postgresql+asyncpg://", "postgresql://")
         self.uri = uri
-        self.conn = None
+        # Shared connection pool – re-uses sockets across jobs, avoids TLS
+        # handshakes and auth for every INSERT call.  A small pool is enough
+        # because inserts are short-lived.
+        self.pool: ConnectionPool = ConnectionPool(conninfo=self.uri, min_size=1, max_size=10, timeout=60)
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        # Don't initialize here - initialization will be handled separately
+
+        # Initialize external storage if enabled
+        self.enable_external_storage = enable_external_storage
+        self.storage: Optional[BaseStorage] = None
+        self._document_app_id_cache: Dict[str, str] = {}  # Cache for document app_ids
+
+        if enable_external_storage:
+            self.storage = self._init_storage()
+
+        # Optionally initialize database objects (tables, functions, etc.)
+        # This ensures that required items like the max_sim function exist and
+        # avoids runtime errors when the store is first used.
+        if auto_initialize:
+            try:
+                self.initialize()
+            except Exception as exc:
+                # Log the failure but do not crash the application – callers
+                # can still attempt explicit initialization or handle errors.
+                logger.error("Auto-initialization of MultiVectorStore failed: %s", exc)
+
+    def _init_storage(self) -> BaseStorage:
+        """Initialize appropriate storage backend based on settings."""
+        try:
+            settings = get_settings()
+            if settings.STORAGE_PROVIDER == "aws-s3":
+                logger.info("Initializing S3 storage for multi-vector chunks")
+                return S3Storage(
+                    aws_access_key=settings.AWS_ACCESS_KEY,
+                    aws_secret_key=settings.AWS_SECRET_ACCESS_KEY,
+                    region_name=settings.AWS_REGION,
+                    default_bucket=MULTIVECTOR_CHUNKS_BUCKET,
+                )
+            else:
+                logger.info("Initializing local storage for multi-vector chunks")
+                storage_path = getattr(settings, "LOCAL_STORAGE_PATH", "./storage")
+                return LocalStorage(storage_path=storage_path)
+        except Exception as e:
+            logger.error(f"Failed to initialize external storage: {e}")
+            return None
 
     @contextmanager
     def get_connection(self):
@@ -56,20 +114,22 @@ class MultiVectorStore(BaseVectorStore):
         # Try to establish a new connection with retries
         while attempt < self.max_retries:
             try:
-                # Always create a fresh connection for critical operations
-                conn = psycopg.connect(self.uri, autocommit=True)
-                # Register vector extension on every new connection
-                register_vector(conn)
+                # Borrow a pooled connection (blocking wait). Autocommit stays
+                # disabled so we can batch-commit.
+                conn = self.pool.getconn()
 
                 try:
                     yield conn
                     return
                 finally:
-                    # Always close connections after use
+                    # Release connection back to the pool
                     try:
-                        conn.close()
+                        self.pool.putconn(conn)
                     except Exception:
-                        pass
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
             except psycopg.OperationalError as e:
                 last_error = e
                 attempt += 1
@@ -166,45 +226,59 @@ class MultiVectorStore(BaseVectorStore):
                 # Log index creation failure but continue
                 logger.warning(f"Failed to create index: {str(e)}")
 
+            # Create max_sim function for multi-vector similarity search
+            # This function is specific to multi-vector operations and belongs here
             try:
-                # First, try to drop the existing function if it exists
                 with self.get_connection() as conn:
-                    conn.execute(
+                    exists_check = conn.execute(
                         """
-                        DROP FUNCTION IF EXISTS max_sim(bit[], bit[])
+                        SELECT EXISTS (
+                            SELECT 1 FROM pg_proc 
+                            WHERE proname = 'max_sim' 
+                            AND pg_get_function_arguments(oid) = 'document bit[], query bit[]'
+                        )
                     """
-                    )
-                    logger.info("Dropped existing max_sim function")
-
-                    # Create max_sim function
-                    conn.execute(
+                    ).fetchone()[0]
+                    
+                    if not exists_check:
+                        logger.info("Creating max_sim function for multi-vector similarity search")
+                        conn.execute(
+                            """
+                            CREATE OR REPLACE FUNCTION public.max_sim(document bit[], query bit[]) 
+                            RETURNS double precision 
+                            LANGUAGE SQL
+                            IMMUTABLE
+                            PARALLEL SAFE
+                            AS $$
+                                WITH queries AS (
+                                    SELECT row_number() OVER () AS query_number, *
+                                    FROM (SELECT unnest(query) AS query) AS foo
+                                ),
+                                documents AS (
+                                    SELECT unnest(document) AS document
+                                ),
+                                similarities AS (
+                                    SELECT
+                                        query_number,
+                                        1.0 - (bit_count(document # query)::float /
+                                            greatest(bit_length(query), 1)::float) AS similarity
+                                    FROM queries CROSS JOIN documents
+                                ),
+                                max_similarities AS (
+                                    SELECT MAX(similarity) AS max_similarity FROM similarities GROUP BY query_number
+                                )
+                                SELECT COALESCE(SUM(max_similarity), 0.0) FROM max_similarities
+                            $$
                         """
-                        CREATE OR REPLACE FUNCTION max_sim(document bit[], query bit[]) RETURNS double precision AS $$
-                            WITH queries AS (
-                                SELECT row_number() OVER () AS query_number, *
-                                FROM (SELECT unnest(query) AS query) AS foo
-                            ),
-                            documents AS (
-                                SELECT unnest(document) AS document
-                            ),
-                            similarities AS (
-                                SELECT
-                                    query_number,
-                                    1.0 - (bit_count(document # query)::float /
-                                        greatest(bit_length(query), 1)::float) AS similarity
-                                FROM queries CROSS JOIN documents
-                            ),
-                            max_similarities AS (
-                                SELECT MAX(similarity) AS max_similarity FROM similarities GROUP BY query_number
-                            )
-                            SELECT SUM(max_similarity) FROM max_similarities
-                        $$ LANGUAGE SQL
-                    """
-                    )
-                    logger.info("Created max_sim function successfully")
+                        )
+                        conn.commit()
+                        logger.info("Created max_sim function successfully")
+                    else:
+                        logger.debug("max_sim function already exists")
+                        
             except Exception as e:
-                logger.error(f"Error creating max_sim function: {str(e)}")
-                # Continue even if function creation fails - it might already exist and be usable
+                logger.error(f"Error creating or checking max_sim function: {str(e)}")
+                # Continue - we'll get a runtime error if the function is actually missing
 
             logger.info("MultiVectorStore initialized successfully")
             return True
@@ -221,52 +295,211 @@ class MultiVectorStore(BaseVectorStore):
 
         return [Bit(embedding > 0) for embedding in embeddings]
 
-    async def store_embeddings(self, chunks: List[DocumentChunk]) -> Tuple[bool, List[str]]:
-        """Store document chunks with their multi-vector embeddings."""
-        # try:
-        if not chunks:
-            return True, []
+    async def _get_document_app_id(self, document_id: str) -> str:
+        """Get app_id for a document, with caching."""
+        if document_id in self._document_app_id_cache:
+            return self._document_app_id_cache[document_id]
 
-        stored_ids = []
-        with self.get_connection() as conn:
-            for chunk in chunks:
-                # Ensure embeddings exist
-                if not hasattr(chunk, "embedding") or chunk.embedding is None:
-                    logger.error(f"Missing embeddings for chunk {chunk.document_id}-{chunk.chunk_number}")
-                    continue
+        try:
+            query = "SELECT system_metadata->>'app_id' FROM documents WHERE external_id = %s"
+            with self.get_connection() as conn:
+                result = conn.execute(query, (document_id,)).fetchone()
 
-                # For multi-vector embeddings, we expect a list of vectors
-                embeddings = chunk.embedding
+            app_id = result[0] if result and result[0] else DEFAULT_APP_ID
+            self._document_app_id_cache[document_id] = app_id
+            return app_id
+        except Exception as e:
+            logger.warning(f"Failed to get app_id for document {document_id}: {e}")
+            return DEFAULT_APP_ID
 
-                # Create binary representation for each vector
-                binary_embeddings = self._binary_quantize(embeddings)
+    def _determine_file_extension(self, content: str, chunk_metadata: Optional[str]) -> str:
+        """Determine appropriate file extension based on content and metadata."""
+        try:
+            # Parse chunk metadata to check if it's an image
+            if chunk_metadata:
+                metadata = json.loads(chunk_metadata)
+                is_image = metadata.get("is_image", False)
 
-                # Insert into database with retry logic
+                if is_image:
+                    # For images, auto-detect from base64 content
+                    return detect_file_type(content)
+                else:
+                    # For text content, use .txt
+                    return ".txt"
+            else:
+                # No metadata, try to auto-detect
+                return detect_file_type(content)
 
-                conn.execute(
-                    """
-                    INSERT INTO multi_vector_embeddings
-                    (document_id, chunk_number, content, chunk_metadata, embeddings)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        chunk.document_id,
-                        chunk.chunk_number,
-                        chunk.content,
-                        str(chunk.metadata),
-                        binary_embeddings,
-                    ),
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Error parsing chunk metadata: {e}")
+            # Fallback to auto-detection
+            return detect_file_type(content)
+
+    def _generate_storage_key(self, app_id: str, document_id: str, chunk_number: int, extension: str) -> str:
+        """Generate storage key path."""
+        return f"{app_id}/{document_id}/{chunk_number}{extension}"
+
+    async def _store_content_externally(
+        self, content: str, document_id: str, chunk_number: int, chunk_metadata: Optional[str]
+    ) -> Optional[str]:
+        """Store chunk content in external storage and return storage key."""
+        if not self.storage:
+            return None
+
+        try:
+            # Get app_id for this document
+            app_id = await self._get_document_app_id(document_id)
+
+            # Determine file extension
+            extension = self._determine_file_extension(content, chunk_metadata)
+
+            # Generate storage key
+            storage_key = self._generate_storage_key(app_id, document_id, chunk_number, extension)
+
+            # Store content in external storage
+            if extension == ".txt":
+                # For text content, store as-is without base64 encoding
+                # Convert content to base64 for storage interface compatibility
+                content_bytes = content.encode("utf-8")
+                content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+                await self.storage.upload_from_base64(
+                    content=content_b64, key=storage_key, content_type="text/plain", bucket=MULTIVECTOR_CHUNKS_BUCKET
+                )
+            else:
+                # For images, content should already be base64
+                await self.storage.upload_from_base64(
+                    content=content, key=storage_key, bucket=MULTIVECTOR_CHUNKS_BUCKET
                 )
 
-                stored_ids.append(f"{chunk.document_id}-{chunk.chunk_number}")
+            logger.debug(f"Stored chunk content externally with key: {storage_key}")
+            return storage_key
 
-        logger.debug(f"{len(stored_ids)} vector embeddings added successfully!")
-        return len(stored_ids) > 0, stored_ids
+        except Exception as e:
+            logger.error(f"Failed to store content externally for {document_id}-{chunk_number}: {e}")
+            return None
 
-        # except Exception as e:
-        #     logger.error(f"Error storing multi-vector embeddings: {str(e)}")
-        #     raise e
-        #     return False, []
+    def _is_storage_key(self, content: str) -> bool:
+        """Check if content field contains a storage key rather than actual content."""
+        # Storage keys are short paths with slashes, not base64/long content
+        return (
+            len(content) < 500 and "/" in content and not content.startswith("data:") and not content.startswith("http")
+        )
+
+    async def _retrieve_content_from_storage(self, storage_key: str, chunk_metadata: Optional[str]) -> str:
+        """Retrieve content from external storage and convert to expected format."""
+        logger.debug(f"Attempting to retrieve content from storage key: {storage_key}")
+
+        if not self.storage:
+            logger.warning(f"External storage not available for retrieving key: {storage_key}")
+            return storage_key  # Return storage key as fallback
+
+        try:
+            # Download content from storage
+            logger.debug(f"Downloading from bucket: {MULTIVECTOR_CHUNKS_BUCKET}, key: {storage_key}")
+            if isinstance(self.storage, S3Storage):
+                storage_key = f"{MULTIVECTOR_CHUNKS_BUCKET}/{storage_key}"
+            try:
+                content_bytes = await self.storage.download_file(bucket=MULTIVECTOR_CHUNKS_BUCKET, key=storage_key)
+            except Exception:
+                storage_key = f"{MULTIVECTOR_CHUNKS_BUCKET}/{storage_key}.txt"
+                content_bytes = await self.storage.download_file(bucket=MULTIVECTOR_CHUNKS_BUCKET, key=storage_key)
+
+            if not content_bytes:
+                logger.error(f"No content downloaded for storage key: {storage_key}")
+                return storage_key
+
+            logger.debug(f"Downloaded {len(content_bytes)} bytes for key: {storage_key}")
+
+            # Determine if this should be returned as base64 or text
+            try:
+                if chunk_metadata:
+                    metadata = json.loads(chunk_metadata)
+                    is_image = metadata.get("is_image", False)
+                    logger.debug(f"Chunk metadata indicates is_image: {is_image}")
+
+                    if is_image:
+                        # For images, return as base64 string
+                        result = base64.b64encode(content_bytes).decode("utf-8")
+                        logger.debug(f"Returning image as base64, length: {len(result)}")
+                        return result
+                    else:
+                        # For text, return decoded string
+                        result = content_bytes.decode("utf-8")
+                        logger.debug(f"Returning text content, length: {len(result)}")
+                        return result
+                else:
+                    # No metadata, try to determine based on content
+                    logger.debug("No metadata, auto-detecting content type")
+                    # If it's valid UTF-8, treat as text
+                    try:
+                        result = content_bytes.decode("utf-8")
+                        logger.debug(f"Auto-detected as text, length: {len(result)}")
+                        return result
+                    except UnicodeDecodeError:
+                        # If not valid UTF-8, treat as binary (image) and return base64
+                        result = base64.b64encode(content_bytes).decode("utf-8")
+                        logger.debug(f"Auto-detected as binary, returning base64, length: {len(result)}")
+                        return result
+
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"Error determining content type for {storage_key}: {e}")
+                # Fallback: try text first, then base64
+                try:
+                    return content_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    return base64.b64encode(content_bytes).decode("utf-8")
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve content from storage key {storage_key}: {e}", exc_info=True)
+            return storage_key  # Return storage key as fallback
+
+    async def store_embeddings(self, chunks: List[DocumentChunk]) -> Tuple[bool, List[str]]:
+        """Store document chunks with their multi-vector embeddings."""
+        # Prepare a list of row tuples for executemany
+        rows = []
+        for chunk in chunks:
+            if not hasattr(chunk, "embedding") or chunk.embedding is None:
+                logger.error(f"Missing embeddings for chunk {chunk.document_id}-{chunk.chunk_number}")
+                continue
+
+            binary_embeddings = self._binary_quantize(chunk.embedding)
+
+            # Handle content storage (external vs database)
+            content_to_store = chunk.content
+
+            if self.enable_external_storage and self.storage:
+                # Try to store content externally
+                storage_key = await self._store_content_externally(
+                    chunk.content, chunk.document_id, chunk.chunk_number, str(chunk.metadata)
+                )
+
+                if storage_key:
+                    content_to_store = storage_key
+                    logger.debug(f"Stored chunk {chunk.document_id}-{chunk.chunk_number} externally")
+                else:
+                    logger.warning(
+                        f"Failed to store chunk {chunk.document_id}-{chunk.chunk_number} externally, using database"
+                    )
+
+            rows.append(
+                (
+                    chunk.document_id,
+                    chunk.chunk_number,
+                    content_to_store,
+                    str(chunk.metadata),
+                    binary_embeddings,
+                )
+            )
+
+        if not rows:
+            return True, []
+
+        # Off-load blocking DB I/O to a thread so we don't block the event loop
+        await asyncio.to_thread(self._bulk_insert_rows, rows)
+
+        stored_ids = [f"{r[0]}-{r[1]}" for r in rows]
+        logger.debug(f"{len(stored_ids)} multi-vector embeddings added in bulk")
+        return True, stored_ids
 
     async def query_similar(
         self,
@@ -275,47 +508,74 @@ class MultiVectorStore(BaseVectorStore):
         doc_ids: Optional[List[str]] = None,
     ) -> List[DocumentChunk]:
         """Find similar chunks using the max_sim function for multi-vectors."""
-        # try:
         # Convert query embeddings to binary format
         binary_query_embeddings = self._binary_quantize(query_embedding)
 
-        # Build query
-        query = """
-            SELECT id, document_id, chunk_number, content, chunk_metadata,
-                    max_sim(embeddings, %s) AS similarity
-            FROM multi_vector_embeddings
-        """
+        def _bit_raw(b: Bit) -> str:
+            """Return raw bit string without 'Bit(...)' wrapper"""
+            s = str(b)
+            # Expected formats: "Bit('1010')" or "Bit(1010)"
+            if s.startswith("Bit("):
+                s = s[4:-1]  # strip wrapper
+                s = s.strip("'")
+            return s
 
-        params = [binary_query_embeddings]
+        bit_strings = [_bit_raw(b) for b in binary_query_embeddings]
+        array_literal = "ARRAY[" + ",".join(f"B'{s}'" for s in bit_strings) + "]::bit(128)[]"
 
-        # Add document filter if needed with proper parameterization
+        # Start query with inlined array literal (internal usage only)
+        query = (
+            "SELECT id, document_id, chunk_number, content, chunk_metadata, "
+            f"max_sim(embeddings, {array_literal}) AS similarity "
+            "FROM multi_vector_embeddings"
+        )
+
+        params: List = []
+
         if doc_ids:
-            # Use placeholders for each document ID
             placeholders = ", ".join(["%s"] * len(doc_ids))
             query += f" WHERE document_id IN ({placeholders})"
-            # Add document IDs to params
             params.extend(doc_ids)
 
-        # Add ordering and limit
         query += " ORDER BY similarity DESC LIMIT %s"
         params.append(k)
 
-        # Execute query with retry logic
         with self.get_connection() as conn:
-            result = conn.execute(query, params).fetchall()
+            result = conn.execute(query, tuple(params)).fetchall()
 
-        # Convert to DocumentChunks
+        # Convert to DocumentChunks with external storage support
         chunks = []
         for row in result:
             try:
-                metadata = eval(row[4]) if row[4] else {}
-            except (ValueError, SyntaxError):
+                metadata = json.loads(row[4]) if row[4] else {}
+            except Exception:
                 metadata = {}
+
+            content = row[3]
+
+            # Handle external storage retrieval
+            logger.debug(
+                f"Checking content for chunk {row[1]}-{row[2]}: is_storage_key={self._is_storage_key(content)}, enable_external_storage={self.enable_external_storage}"
+            )
+            if self.enable_external_storage and self._is_storage_key(content):
+                logger.info(f"Retrieving external content for chunk {row[1]}-{row[2]} from storage key: {content}")
+                try:
+                    original_content = content
+                    content = await self._retrieve_content_from_storage(content, row[4])
+                    if content == original_content:
+                        logger.warning(f"Content retrieval failed, still showing storage key: {content}")
+                    else:
+                        logger.info(
+                            f"Successfully retrieved content for chunk {row[1]}-{row[2]}, length: {len(content)}"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to retrieve content from storage for chunk {row[1]}-{row[2]}: {e}")
+                    # Keep storage key as content if retrieval fails
 
             chunk = DocumentChunk(
                 document_id=row[1],
                 chunk_number=row[2],
-                content=row[3],
+                content=content,
                 embedding=[],  # Don't send embeddings back
                 metadata=metadata,
                 score=float(row[5]),  # Use the similarity score from max_sim
@@ -365,18 +625,39 @@ class MultiVectorStore(BaseVectorStore):
         with self.get_connection() as conn:
             result = conn.execute(query).fetchall()
 
-        # Convert to DocumentChunks
+        # Convert to DocumentChunks with external storage support
         chunks = []
         for row in result:
             try:
-                metadata = eval(row[3]) if row[3] else {}
-            except (ValueError, SyntaxError):
+                metadata = json.loads(row[3]) if row[3] else {}
+            except Exception:
                 metadata = {}
+
+            content = row[2]
+
+            # Handle external storage retrieval
+            logger.debug(
+                f"Checking content for chunk {row[0]}-{row[1]}: is_storage_key={self._is_storage_key(content)}, enable_external_storage={self.enable_external_storage}"
+            )
+            if self.enable_external_storage and self._is_storage_key(content):
+                logger.info(f"Retrieving external content for chunk {row[0]}-{row[1]} from storage key: {content}")
+                try:
+                    original_content = content
+                    content = await self._retrieve_content_from_storage(content, row[3])
+                    if content == original_content:
+                        logger.warning(f"Content retrieval failed, still showing storage key: {content}")
+                    else:
+                        logger.info(
+                            f"Successfully retrieved content for chunk {row[0]}-{row[1]}, length: {len(content)}"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to retrieve content from storage for chunk {row[0]}-{row[1]}: {e}")
+                    # Keep storage key as content if retrieval fails
 
             chunk = DocumentChunk(
                 document_id=row[0],
                 chunk_number=row[1],
-                content=row[2],
+                content=content,
                 embedding=[],  # Don't send embeddings back
                 metadata=metadata,
                 score=0.0,  # No relevance score for direct retrieval
@@ -411,9 +692,28 @@ class MultiVectorStore(BaseVectorStore):
 
     def close(self):
         """Close the database connection."""
-        if self.conn:
-            try:
-                self.conn.close()
-                self.conn = None
-            except Exception as e:
-                logger.error(f"Error closing connection: {str(e)}")
+        # Close pool gracefully – this will close all underlying connections
+        try:
+            self.pool.close()
+        except Exception as e:
+            logger.error(f"Error closing connection pool: {e}")
+
+    # ----------------- internal helpers -----------------
+
+    def _bulk_insert_rows(self, rows: List[Tuple]):
+        """Sync helper executed in a worker thread to avoid blocking."""
+        with self.get_connection() as conn:
+            # Register vector extension for this connection
+            register_vector(conn)
+
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO multi_vector_embeddings
+                    (document_id, chunk_number, content, chunk_metadata, embeddings)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    rows,
+                )
+                # Single commit for all rows – very fast
+                conn.commit()

@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM python:3.12.5-slim as builder
+FROM python:3.11.12-slim AS builder
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set working directory
 WORKDIR /app
@@ -12,17 +15,52 @@ RUN apt-get update && apt-get install -y \
     g++ \
     cmake \
     python3-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Install Rust using the simpler method
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+# Activating cargo env for this RUN instruction and subsequent ones in this stage.
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set uv environment variables
+ENV UV_LINK_MODE=copy
+ENV UV_CACHE_DIR=/root/.cache/uv
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:${PATH}"
+
+# Copy project definition and lock file
+COPY pyproject.toml uv.lock ./
+
+# Create venv and install dependencies from lockfile (excluding the project itself initially for better caching)
+# This also creates the /app/.venv directory
+# Cache buster: 1 - verbose flag added
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    uv sync --verbose --locked --no-install-project
+
+# Copy the rest of the application code
+# Assuming start_server.py is at the root or handled by pyproject.toml structure.
+COPY . .
+
+# Install the project itself into the venv in non-editable mode
+# Cache buster: 1 - verbose flag added
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    uv sync --verbose --locked --no-editable
+
+# Install additional packages as requested
+# Cache buster: 1 - verbose flag added
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    uv pip install --verbose 'colpali-engine@git+https://github.com/illuin-tech/colpali@80fb72c9b827ecdb5687a3a8197077d0d01791b3'
+
+# Cache buster: 1 - verbose flag already present
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    uv pip install --upgrade --verbose --force-reinstall --no-cache-dir llama-cpp-python==0.3.5
 
 # Download NLTK data
 RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt averaged_perceptron_tagger
 
 # Production stage
-FROM python:3.12.5-slim
+FROM python:3.11.12-slim
 
 # Set working directory
 WORKDIR /app
@@ -40,11 +78,15 @@ RUN apt-get update && apt-get install -y \
     g++ \
     cmake \
     python3-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder
-COPY --from=builder /root/.local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /root/.local/bin /usr/local/bin
+# Copy the virtual environment from the builder stage
+COPY --from=builder /app/.venv /app/.venv
+# Copy uv binaries from the builder stage
+COPY --from=builder /bin/uv /bin/uv
+COPY --from=builder /bin/uvx /bin/uvx
+
 # Copy NLTK data from builder
 COPY --from=builder /usr/local/share/nltk_data /usr/local/share/nltk_data
 
@@ -55,7 +97,8 @@ RUN mkdir -p storage logs
 ENV PYTHONUNBUFFERED=1
 ENV HOST=0.0.0.0
 ENV PORT=8000
-ENV PATH="/usr/local/bin:$PATH"
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:/usr/local/bin:${PATH}"
 
 # Create default configuration
 RUN echo '[api]\n\
@@ -113,23 +156,35 @@ fi\n\
 # Function to check PostgreSQL\n\
 check_postgres() {\n\
     # Verify database connection\n\
-    if ! PGPASSWORD=$PGPASSWORD psql -h postgres -U $PGUSER -d $PGDATABASE -c "SELECT 1" > /dev/null 2>&1; then\n\
-        echo "Error: Could not connect to PostgreSQL database"\n\
-        exit 1\n\
-    fi\n\
+    echo "Waiting for PostgreSQL to be ready..."\n\
+    until PGPASSWORD=$PGPASSWORD psql -h postgres -U $PGUSER -d $PGDATABASE -c "SELECT 1" > /dev/null 2>&1; do\n\
+        echo "PostgreSQL is unavailable - sleeping"\n\
+        sleep 2\n\
+    done\n\
     echo "PostgreSQL connection verified!"\n\
 }\n\
 \n\
 # Check PostgreSQL\n\
 check_postgres\n\
 \n\
-# Start the application with standard asyncio event loop\n\
-exec uvicorn core.api:app --host $HOST --port $PORT --loop asyncio --http auto --ws auto --lifespan auto\n\
+# Check if command arguments were passed ($# is the number of arguments)\n\
+if [ $# -gt 0 ]; then\n\
+    # If arguments exist, execute them (e.g., execute "arq core.workers...")\n\
+    exec "$@"\n\
+else\n\
+    # Otherwise, execute the default command (uv run start_server.py)\n\
+    exec uv run uvicorn core.api:app --host $HOST --port $PORT --loop asyncio --http auto --ws auto --lifespan auto\n\
+fi\n\
 ' > /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoint.sh
 
 # Copy application code
+# pyproject.toml is needed for uv to identify the project context for `uv run`
+COPY pyproject.toml ./
 COPY core ./core
+COPY ee ./ee
 COPY README.md LICENSE ./
+# Assuming start_server.py is at the root of your project
+COPY start_server.py ./
 
 # Labels for the image
 LABEL org.opencontainers.image.title="Morphik Core"

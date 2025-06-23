@@ -1,16 +1,16 @@
 "use client";
 
-import React, { useState } from 'react';
-import { Badge } from '@/components/ui/badge';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import { Button } from '@/components/ui/button';
-import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { Info } from 'lucide-react';
+import React, { useState } from "react";
+import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Button } from "@/components/ui/button";
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
+import { Info, Calendar, Clock } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import Image from 'next/image';
+import Image from "next/image";
+import DeleteConfirmationModal from "./DeleteConfirmationModal";
 
-import { Document, Folder } from '@/components/types';
+import { Document, Folder } from "@/components/types";
 
 interface DocumentDetailProps {
   selectedDocument: Document | null;
@@ -33,15 +33,16 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
   refreshDocuments,
   refreshFolders,
   loading,
-  onClose
+  onClose,
 }) => {
   const [isMovingToFolder, setIsMovingToFolder] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
 
   if (!selectedDocument) {
     return (
-      <div className="h-[calc(100vh-200px)] flex items-center justify-center p-8 border border-dashed rounded-lg">
+      <div className="flex h-[calc(100vh-200px)] items-center justify-center rounded-lg border border-dashed p-8">
         <div className="text-center text-muted-foreground">
-          <Info className="mx-auto h-12 w-12 mb-2" />
+          <Info className="mx-auto mb-2 h-12 w-12" />
           <p>Select a document to view details</p>
         </div>
       </div>
@@ -49,6 +50,52 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
   }
 
   const currentFolder = selectedDocument.system_metadata?.folder_name as string | undefined;
+  const status = selectedDocument.system_metadata?.status as string | undefined;
+  const createdAt = selectedDocument.system_metadata?.created_at as string | undefined;
+  const updatedAt = selectedDocument.system_metadata?.updated_at as string | undefined;
+  const version = selectedDocument.system_metadata?.version as number | undefined;
+
+  // Format dates for display
+  const formatDate = (dateString?: string) => {
+    if (!dateString) return "N/A";
+    try {
+      const date = new Date(dateString);
+      return date.toLocaleString();
+    } catch {
+      return dateString;
+    }
+  };
+
+  // Get status badge variant
+  const getStatusBadge = (status?: string) => {
+    if (!status) return <Badge variant="outline">Unknown</Badge>;
+
+    switch (status.toLowerCase()) {
+      case "completed":
+        return (
+          <Badge variant="secondary" className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100">
+            Completed
+          </Badge>
+        );
+      case "processing":
+        return (
+          <Badge variant="secondary" className="bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-100">
+            Processing
+          </Badge>
+        );
+      case "failed":
+        return <Badge variant="destructive">Failed</Badge>;
+      default:
+        return <Badge variant="outline">{status}</Badge>;
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (selectedDocument) {
+      await handleDeleteDocument(selectedDocument.external_id);
+      setShowDeleteModal(false);
+    }
+  };
 
   const handleMoveToFolder = async (folderName: string | null) => {
     if (isMovingToFolder || !selectedDocument) return;
@@ -66,11 +113,11 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
 
           // Add to folder using folder ID
           await fetch(`${apiBaseUrl}/folders/${targetFolder.id}/documents/${documentId}`, {
-            method: 'POST',
+            method: "POST",
             headers: {
-              'Content-Type': 'application/json',
-              ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
-            }
+              "Content-Type": "application/json",
+              ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+            },
           });
         } else {
           console.error(`Could not find folder with name: ${folderName}`);
@@ -84,11 +131,11 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
         if (currentFolderObj && currentFolderObj.id) {
           // Remove from current folder using folder ID
           await fetch(`${apiBaseUrl}/folders/${currentFolderObj.id}/documents/${documentId}`, {
-            method: 'DELETE',
+            method: "DELETE",
             headers: {
-              'Content-Type': 'application/json',
-              ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
-            }
+              "Content-Type": "application/json",
+              ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+            },
           });
         }
       }
@@ -98,23 +145,28 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
       // Then refresh documents with the updated folder information
       await refreshDocuments();
     } catch (error) {
-      console.error('Error updating folder:', error);
+      console.error("Error updating folder:", error);
     } finally {
       setIsMovingToFolder(false);
     }
   };
 
   return (
-    <div className="border rounded-lg">
-      <div className="bg-muted px-4 py-3 border-b sticky top-0 flex justify-between items-center">
+    <div className="rounded-lg border">
+      <div className="sticky top-0 flex items-center justify-between border-b bg-muted px-4 py-3">
         <h3 className="text-lg font-semibold">Document Details</h3>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={onClose}
-          className="rounded-full hover:bg-background/80"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <Button variant="ghost" size="icon" onClick={onClose} className="rounded-full hover:bg-background/80">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
             <line x1="18" y1="6" x2="6" y2="18"></line>
             <line x1="6" y1="6" x2="18" y2="18"></line>
           </svg>
@@ -123,24 +175,30 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
       </div>
 
       <ScrollArea className="h-[calc(100vh-200px)]">
-        <div className="p-4 space-y-4">
+        <div className="space-y-4 p-4">
           <div>
-            <h3 className="font-medium mb-1">Filename</h3>
-            <p>{selectedDocument.filename || 'N/A'}</p>
+            <h3 className="mb-1 font-medium">Filename</h3>
+            <p>{selectedDocument.filename || "N/A"}</p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <h3 className="mb-1 font-medium">Content Type</h3>
+              <Badge variant="secondary">{selectedDocument.content_type}</Badge>
+            </div>
+            <div>
+              <h3 className="mb-1 font-medium">Status</h3>
+              {getStatusBadge(status)}
+            </div>
           </div>
 
           <div>
-            <h3 className="font-medium mb-1">Content Type</h3>
-            <Badge variant="secondary">{selectedDocument.content_type}</Badge>
-          </div>
-
-          <div>
-            <h3 className="font-medium mb-1">Folder</h3>
+            <h3 className="mb-1 font-medium">Folder</h3>
             <div className="flex items-center gap-2">
               <Image src="/icons/folder-icon.png" alt="Folder" width={16} height={16} />
               <Select
                 value={currentFolder || "_none"}
-                onValueChange={(value) => handleMoveToFolder(value === "_none" ? null : value)}
+                onValueChange={value => handleMoveToFolder(value === "_none" ? null : value)}
                 disabled={isMovingToFolder}
               >
                 <SelectTrigger className="w-full">
@@ -148,7 +206,7 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="_none">Not in a folder</SelectItem>
-                  {folders.map((folder) => (
+                  {folders.map(folder => (
                     <SelectItem key={folder.name} value={folder.name}>
                       {folder.name}
                     </SelectItem>
@@ -158,74 +216,77 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
             </div>
           </div>
 
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <h3 className="mb-1 flex items-center gap-1 font-medium">
+                <Calendar className="h-4 w-4" />
+                Created
+              </h3>
+              <p className="text-sm">{formatDate(createdAt)}</p>
+            </div>
+            <div>
+              <h3 className="mb-1 flex items-center gap-1 font-medium">
+                <Clock className="h-4 w-4" />
+                Updated
+              </h3>
+              <p className="text-sm">{formatDate(updatedAt)}</p>
+            </div>
+          </div>
+
           <div>
-            <h3 className="font-medium mb-1">Document ID</h3>
+            <h3 className="mb-1 font-medium">Document ID</h3>
             <p className="font-mono text-xs">{selectedDocument.external_id}</p>
           </div>
+
+          {version !== undefined && (
+            <div>
+              <h3 className="mb-1 font-medium">Version</h3>
+              <p>{version}</p>
+            </div>
+          )}
 
           <Accordion type="single" collapsible>
             <AccordionItem value="metadata">
               <AccordionTrigger>Metadata</AccordionTrigger>
               <AccordionContent>
-                <pre className="bg-muted p-2 rounded text-xs overflow-x-auto whitespace-pre-wrap">
+                <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted p-2 text-xs">
                   {JSON.stringify(selectedDocument.metadata, null, 2)}
                 </pre>
               </AccordionContent>
             </AccordionItem>
 
             <AccordionItem value="system-metadata">
-              <AccordionTrigger>System Metadata</AccordionTrigger>
+              <AccordionTrigger>Text</AccordionTrigger>
               <AccordionContent>
-                <pre className="bg-muted p-2 rounded text-xs overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(selectedDocument.system_metadata, null, 2)}
-                </pre>
-              </AccordionContent>
-            </AccordionItem>
-
-            <AccordionItem value="additional-metadata">
-              <AccordionTrigger>Additional Metadata</AccordionTrigger>
-              <AccordionContent>
-                <pre className="bg-muted p-2 rounded text-xs overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(selectedDocument.additional_metadata, null, 2)}
+                <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted p-2 text-xs">
+                  {JSON.stringify(selectedDocument.system_metadata.content, null, 2)}
                 </pre>
               </AccordionContent>
             </AccordionItem>
           </Accordion>
 
-          <div className="pt-4 border-t mt-4">
-            <Dialog>
-              <DialogTrigger asChild>
-                <Button variant="outline" size="sm" className="w-full border-red-500 text-red-500 hover:bg-red-100 dark:hover:bg-red-950">
-                  Delete Document
-                </Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Delete Document</DialogTitle>
-                  <DialogDescription>
-                    Are you sure you want to delete this document? This action cannot be undone.
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="py-3">
-                  <p className="font-medium">Document: {selectedDocument.filename || selectedDocument.external_id}</p>
-                  <p className="text-sm text-muted-foreground mt-1">ID: {selectedDocument.external_id}</p>
-                </div>
-                <DialogFooter>
-                  <Button variant="outline" onClick={() => (document.querySelector('[data-state="open"] button[data-state="closed"]') as HTMLElement)?.click()}>Cancel</Button>
-                  <Button
-                    variant="outline"
-                    className="border-red-500 text-red-500 hover:bg-red-100 dark:hover:bg-red-950"
-                    onClick={() => handleDeleteDocument(selectedDocument.external_id)}
-                    disabled={loading}
-                  >
-                    {loading ? 'Deleting...' : 'Delete'}
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
+          <div className="mt-4 border-t pt-4">
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full border-red-500 text-red-500 hover:bg-red-100 dark:hover:bg-red-950"
+              onClick={() => setShowDeleteModal(true)}
+              disabled={loading}
+            >
+              Delete Document
+            </Button>
           </div>
         </div>
       </ScrollArea>
+      {selectedDocument && (
+        <DeleteConfirmationModal
+          isOpen={showDeleteModal}
+          onClose={() => setShowDeleteModal(false)}
+          onConfirm={handleDeleteConfirm}
+          itemName={selectedDocument.filename || selectedDocument.external_id}
+          loading={loading}
+        />
+      )}
     </div>
   );
 };

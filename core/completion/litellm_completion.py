@@ -1,6 +1,6 @@
 import logging
 import re  # Import re for parsing model name
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import litellm
 
@@ -30,6 +30,7 @@ def get_system_message() -> Dict[str, str]:
 3. Be clear and concise in your answers
 4. When relevant, cite specific parts of the context to support your answers
 5. For image-based queries, analyze the visual content in conjunction with any text context provided
+6. Format your responses using Markdown.
 
 Remember: Your primary goal is to provide accurate, context-aware responses that help users understand
 and utilize the information in their documents effectively.""",
@@ -203,6 +204,7 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         user_content: str,
         ollama_image_data: List[str],
         request: CompletionRequest,
+        history_messages: List[Dict[str, str]],
     ) -> CompletionResponse:
         """Handle structured output generation with Ollama."""
         try:
@@ -215,7 +217,7 @@ class LiteLLMCompletionModel(BaseCompletionModel):
                 content_data = {"content": user_content, "images": [ollama_image_data[0]]}
 
             # Create messages for Ollama
-            messages = [system_message, {"role": "user", "content": content_data}]
+            messages = [system_message] + history_messages + [{"role": "user", "content": content_data}]
 
             # Get the JSON schema from the dynamic model
             format_schema = dynamic_model.model_json_schema()
@@ -260,6 +262,7 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         user_content: str,
         image_urls: List[str],
         request: CompletionRequest,
+        history_messages: List[Dict[str, str]],
     ) -> CompletionResponse:
         """Handle structured output generation with LiteLLM."""
         import instructor
@@ -274,12 +277,12 @@ class LiteLLMCompletionModel(BaseCompletionModel):
 
             # Add images if available
             if image_urls:
-                NUM_IMAGES = min(3, len(image_urls))
+                NUM_IMAGES = min(5, len(image_urls))
                 for img_url in image_urls[:NUM_IMAGES]:
                     content_list.append({"type": "image_url", "image_url": {"url": img_url}})
 
             # Create messages for instructor
-            messages = [system_message, {"role": "user", "content": content_list}]
+            messages = [system_message] + history_messages + [{"role": "user", "content": content_list}]
 
             # Extract model configuration
             model = self.model_config.get("model_name")
@@ -323,7 +326,11 @@ class LiteLLMCompletionModel(BaseCompletionModel):
             return None
 
     async def _handle_standard_ollama(
-        self, user_content: str, ollama_image_data: List[str], request: CompletionRequest
+        self,
+        user_content: str,
+        ollama_image_data: List[str],
+        request: CompletionRequest,
+        history_messages: List[Dict[str, str]],
     ) -> CompletionResponse:
         """Handle standard (non-structured) output generation with Ollama."""
         logger.debug(f"Using direct Ollama client for model: {self.ollama_base_model_name}")
@@ -335,15 +342,10 @@ class LiteLLMCompletionModel(BaseCompletionModel):
 
         # Add images directly to the user message if available
         if ollama_image_data:
-            if len(ollama_image_data) > 1:
-                logger.warning(
-                    f"Ollama model {self.model_config['model_name']} only supports one image per message. "
-                    "Using the first image and ignoring others."
-                )
-            # Add 'images' key inside the user message dictionary
-            user_message_data["images"] = [ollama_image_data[0]]
+            # Add all images to the user message
+            user_message_data["images"] = ollama_image_data
 
-        ollama_messages = [system_message, user_message_data]
+        ollama_messages = [system_message] + history_messages + [user_message_data]
 
         # Construct Ollama options
         options = {
@@ -375,7 +377,11 @@ class LiteLLMCompletionModel(BaseCompletionModel):
             raise
 
     async def _handle_standard_litellm(
-        self, user_content: str, image_urls: List[str], request: CompletionRequest
+        self,
+        user_content: str,
+        image_urls: List[str],
+        request: CompletionRequest,
+        history_messages: List[Dict[str, str]],
     ) -> CompletionResponse:
         """Handle standard (non-structured) output generation with LiteLLM."""
         logger.debug(f"Using LiteLLM for model: {self.model_config['model_name']}")
@@ -384,14 +390,14 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         include_images = image_urls  # Use the collected full data URIs
 
         if include_images:
-            NUM_IMAGES = min(3, len(image_urls))
+            NUM_IMAGES = min(5, len(image_urls))
             for img_url in image_urls[:NUM_IMAGES]:
                 content_list.append({"type": "image_url", "image_url": {"url": img_url}})
 
         # LiteLLM uses list content format
         user_message = {"role": "user", "content": content_list}
         # Use the system prompt defined earlier
-        litellm_messages = [get_system_message(), user_message]
+        litellm_messages = [get_system_message()] + history_messages + [user_message]
 
         # Prepare LiteLLM parameters
         model_params = {
@@ -419,7 +425,98 @@ class LiteLLMCompletionModel(BaseCompletionModel):
             finish_reason=response.choices[0].finish_reason,
         )
 
-    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+    async def _handle_streaming_litellm(
+        self,
+        user_content: str,
+        image_urls: List[str],
+        request: CompletionRequest,
+        history_messages: List[Dict[str, str]],
+    ) -> AsyncGenerator[str, None]:
+        """Handle streaming output generation with LiteLLM."""
+        logger.debug(f"Using LiteLLM streaming for model: {self.model_config['model_name']}")
+        # Build messages for LiteLLM
+        content_list = [{"type": "text", "text": user_content}]
+        include_images = image_urls  # Use the collected full data URIs
+
+        if include_images:
+            NUM_IMAGES = min(5, len(image_urls))
+            for img_url in image_urls[:NUM_IMAGES]:
+                content_list.append({"type": "image_url", "image_url": {"url": img_url}})
+
+        # LiteLLM uses list content format
+        user_message = {"role": "user", "content": content_list}
+        # Use the system prompt defined earlier
+        litellm_messages = [get_system_message()] + history_messages + [user_message]
+
+        # Prepare LiteLLM parameters
+        model_params = {
+            "model": self.model_config["model_name"],
+            "messages": litellm_messages,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "stream": True,  # Enable streaming
+            "num_retries": 3,
+        }
+
+        for key, value in self.model_config.items():
+            if key != "model_name":
+                model_params[key] = value
+
+        logger.debug(f"Calling LiteLLM streaming with params: {model_params}")
+        response = await litellm.acompletion(**model_params)
+
+        # Stream the response chunks
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    async def _handle_streaming_ollama(
+        self,
+        user_content: str,
+        ollama_image_data: List[str],
+        request: CompletionRequest,
+        history_messages: List[Dict[str, str]],
+    ) -> AsyncGenerator[str, None]:
+        """Handle streaming output generation with Ollama."""
+        logger.debug(f"Using direct Ollama streaming for model: {self.ollama_base_model_name}")
+        client = ollama.AsyncClient(host=self.ollama_api_base)
+
+        # Construct Ollama messages
+        system_message = {"role": "system", "content": get_system_message()["content"]}
+        user_message_data = {"role": "user", "content": user_content}
+
+        # Add images directly to the user message if available
+        if ollama_image_data:
+            # Add all images to the user message
+            user_message_data["images"] = ollama_image_data
+
+        ollama_messages = [system_message] + history_messages + [user_message_data]
+
+        # Construct Ollama options
+        options = {
+            "temperature": request.temperature,
+            "num_predict": (
+                request.max_tokens if request.max_tokens is not None else -1
+            ),  # Default to model's default if None
+        }
+
+        try:
+            response = await client.chat(
+                model=self.ollama_base_model_name,
+                messages=ollama_messages,
+                options=options,
+                stream=True,  # Enable streaming
+            )
+
+            async for chunk in response:
+                if chunk.get("message", {}).get("content"):
+                    yield chunk["message"]["content"]
+
+        except Exception as e:
+            logger.error(f"Error during direct Ollama streaming call: {e}")
+            raise
+
+    async def complete(self, request: CompletionRequest) -> Union[CompletionResponse, AsyncGenerator[str, None]]:
         """
         Generate completion using LiteLLM or direct Ollama client if configured.
 
@@ -427,7 +524,8 @@ class LiteLLMCompletionModel(BaseCompletionModel):
             request: CompletionRequest object containing query, context, and parameters
 
         Returns:
-            CompletionResponse object with the generated text and usage statistics
+            CompletionResponse object with the generated text and usage statistics or
+            AsyncGenerator for streaming responses
         """
         # Process context chunks and handle images
         context_text, image_urls, ollama_image_data = process_context_chunks(request.context_chunks, self.is_ollama)
@@ -435,8 +533,22 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         # Format user content
         user_content = format_user_content(context_text, request.query, request.prompt_template)
 
+        history_messages = [{"role": m.role, "content": m.content} for m in (request.chat_history or [])]
+
         # Check if structured output is requested
         structured_output = request.schema is not None
+
+        # Streaming is not supported with structured output
+        if request.stream_response and structured_output:
+            logger.warning("Streaming is not supported with structured output. Falling back to non-streaming.")
+            request.stream_response = False
+
+        # If streaming is requested and no structured output
+        if request.stream_response and not structured_output:
+            if self.is_ollama:
+                return self._handle_streaming_ollama(user_content, ollama_image_data, request, history_messages)
+            else:
+                return self._handle_streaming_litellm(user_content, image_urls, request, history_messages)
 
         # If structured output is requested, use instructor to handle it
         if structured_output:
@@ -465,14 +577,24 @@ class LiteLLMCompletionModel(BaseCompletionModel):
                 # Try structured output based on model type
                 if self.is_ollama:
                     response = await self._handle_structured_ollama(
-                        dynamic_model, system_message, enhanced_user_content, ollama_image_data, request
+                        dynamic_model,
+                        system_message,
+                        enhanced_user_content,
+                        ollama_image_data,
+                        request,
+                        history_messages,
                     )
                     if response:
                         return response
                     structured_output = False  # Fall back if structured output failed
                 else:
                     response = await self._handle_structured_litellm(
-                        dynamic_model, system_message, enhanced_user_content, image_urls, request
+                        dynamic_model,
+                        system_message,
+                        enhanced_user_content,
+                        image_urls,
+                        request,
+                        history_messages,
                     )
                     if response:
                         return response
@@ -481,6 +603,6 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         # If we're here, either structured output wasn't requested or instructor failed
         # Proceed with standard completion based on model type
         if self.is_ollama:
-            return await self._handle_standard_ollama(user_content, ollama_image_data, request)
+            return await self._handle_standard_ollama(user_content, ollama_image_data, request, history_messages)
         else:
-            return await self._handle_standard_litellm(user_content, image_urls, request)
+            return await self._handle_standard_litellm(user_content, image_urls, request, history_messages)

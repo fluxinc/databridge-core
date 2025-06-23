@@ -1,34 +1,36 @@
 import asyncio
-import base64
 import json
 import logging
-import uuid
+import time  # Add time import for profiling
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import arq
 import jwt
 import tomli
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from starlette.middleware.sessions import SessionMiddleware
 
-from core.cache.llama_cache_factory import LlamaCacheFactory
-from core.completion.litellm_completion import LiteLLMCompletionModel
+from core.agent import MorphikAgent
+from core.app_factory import lifespan
+from core.auth_utils import verify_token
 from core.config import get_settings
+from core.logging_config import setup_logging
 from core.database.postgres_database import PostgresDatabase
-from core.embedding.colpali_embedding_model import ColpaliEmbeddingModel
-from core.embedding.litellm_embedding import LiteLLMEmbeddingModel
+from core.dependencies import get_redis_pool
 from core.limits_utils import check_and_increment_limits
 from core.models.auth import AuthContext, EntityType
+from core.models.chat import ChatMessage
 from core.models.completion import ChunkSource, CompletionResponse
 from core.models.documents import ChunkResult, Document, DocumentResult
 from core.models.folders import Folder, FolderCreate
 from core.models.graph import Graph
 from core.models.prompts import validate_prompt_overrides_with_http_exception
 from core.models.request import (
-    BatchIngestResponse,
+    AgentQueryRequest,
     CompletionQueryRequest,
     CreateGraphRequest,
     GenerateUriRequest,
@@ -37,56 +39,72 @@ from core.models.request import (
     SetFolderRuleRequest,
     UpdateGraphRequest,
 )
-from core.parser.morphik_parser import MorphikParser
-from core.reranker.flag_reranker import FlagReranker
-from core.services.document_service import DocumentService
+from core.routes.ingest import router as ingest_router
 from core.services.telemetry import TelemetryService
-from core.storage.local_storage import LocalStorage
-from core.storage.s3_storage import S3Storage
-from core.vector_store.multi_vector_store import MultiVectorStore
-from core.vector_store.pgvector_store import PGVectorStore
+from core.services_init import document_service
+
+# Set up logging configuration for Docker environment
+setup_logging()
 
 # Initialize FastAPI app
-app = FastAPI(title="Morphik API")
 logger = logging.getLogger(__name__)
 
 
-# Add health check endpoints
-@app.get("/health")
-async def health_check():
-    """Basic health check endpoint."""
-    return {"status": "healthy"}
+# Performance tracking class
+class PerformanceTracker:
+    def __init__(self, operation_name: str):
+        self.operation_name = operation_name
+        self.start_time = time.time()
+        self.phases = {}
+        self.current_phase = None
+        self.phase_start = None
+
+    def start_phase(self, phase_name: str):
+        # End current phase if one is running
+        if self.current_phase and self.phase_start:
+            self.phases[self.current_phase] = time.time() - self.phase_start
+
+        # Start new phase
+        self.current_phase = phase_name
+        self.phase_start = time.time()
+
+    def end_phase(self):
+        if self.current_phase and self.phase_start:
+            self.phases[self.current_phase] = time.time() - self.phase_start
+            self.current_phase = None
+            self.phase_start = None
+
+    def add_suboperation(self, name: str, duration: float):
+        """Add a sub-operation timing"""
+        self.phases[name] = duration
+
+    def log_summary(self, additional_info: str = ""):
+        total_time = time.time() - self.start_time
+
+        # End current phase if still running
+        if self.current_phase and self.phase_start:
+            self.phases[self.current_phase] = time.time() - self.phase_start
+
+        logger.info(f"=== {self.operation_name} Performance Summary ===")
+        logger.info(f"Total time: {total_time:.2f}s")
+
+        # Sort phases by duration (longest first)
+        for phase, duration in sorted(self.phases.items(), key=lambda x: x[1], reverse=True):
+            percentage = (duration / total_time) * 100 if total_time > 0 else 0
+            logger.info(f"  - {phase}: {duration:.2f}s ({percentage:.1f}%)")
+
+        if additional_info:
+            logger.info(additional_info)
+        logger.info("=" * (len(self.operation_name) + 31))
 
 
-@app.get("/health/ready")
-async def readiness_check():
-    """Readiness check that verifies the application is initialized."""
-    return {
-        "status": "ready",
-        "components": {
-            "database": settings.DATABASE_PROVIDER,
-            "vector_store": settings.VECTOR_STORE_PROVIDER,
-            "embedding": settings.EMBEDDING_PROVIDER,
-            "completion": settings.COMPLETION_PROVIDER,
-            "storage": settings.STORAGE_PROVIDER,
-        },
-    }
+# ---------------------------------------------------------------------------
+# Application instance & core initialisation (moved lifespan, rest unchanged)
+# ---------------------------------------------------------------------------
 
+app = FastAPI(lifespan=lifespan)
 
-# Initialize telemetry
-telemetry = TelemetryService()
-
-# Add OpenTelemetry instrumentation - exclude HTTP send/receive spans
-FastAPIInstrumentor.instrument_app(
-    app,
-    excluded_urls="health,health/.*",  # Exclude health check endpoints
-    exclude_spans=["send", "receive"],  # Exclude HTTP send/receive spans to reduce telemetry volume
-    http_capture_headers_server_request=None,  # Don't capture request headers
-    http_capture_headers_server_response=None,  # Don't capture response headers
-    tracer_provider=None,  # Use the global tracer provider
-)
-
-# Add CORS middleware
+# Add CORS middleware (same behaviour as before refactor)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -95,618 +113,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize service
+# Initialise telemetry service
+telemetry = TelemetryService()
+
+# OpenTelemetry instrumentation – exclude noisy spans/headers
+FastAPIInstrumentor.instrument_app(
+    app,
+    excluded_urls="health,health/.*",
+    exclude_spans=["send", "receive"],
+    http_capture_headers_server_request=None,
+    http_capture_headers_server_response=None,
+    tracer_provider=None,
+)
+
+# Global settings object
 settings = get_settings()
 
-# Initialize database
-if not settings.POSTGRES_URI:
-    raise ValueError("PostgreSQL URI is required for PostgreSQL database")
-database = PostgresDatabase(uri=settings.POSTGRES_URI)
+# ---------------------------------------------------------------------------
+# Session cookie behaviour differs between cloud / self-hosted
+# ---------------------------------------------------------------------------
 
-# Redis settings already imported at top of file
-
-
-@app.on_event("startup")
-async def initialize_database():
-    """Initialize database tables and indexes on application startup."""
-    logger.info("Initializing database...")
-    success = await database.initialize()
-    if success:
-        logger.info("Database initialization successful")
-    else:
-        logger.error("Database initialization failed")
-        # We don't raise an exception here to allow the app to continue starting
-        # even if there are initialization errors
-
-
-@app.on_event("startup")
-async def initialize_vector_store():
-    """Initialize vector store tables and indexes on application startup."""
-    # First initialize the primary vector store (PGVectorStore if using pgvector)
-    logger.info("Initializing primary vector store...")
-    if hasattr(vector_store, "initialize"):
-        success = await vector_store.initialize()
-        if success:
-            logger.info("Primary vector store initialization successful")
-        else:
-            logger.error("Primary vector store initialization failed")
-    else:
-        logger.warning("Primary vector store does not have an initialize method")
-
-    # Then initialize the multivector store if enabled
-    if settings.ENABLE_COLPALI and colpali_vector_store:
-        logger.info("Initializing multivector store...")
-        # Handle both synchronous and asynchronous initialize methods
-        if hasattr(colpali_vector_store.initialize, "__awaitable__"):
-            success = await colpali_vector_store.initialize()
-        else:
-            success = colpali_vector_store.initialize()
-
-        if success:
-            logger.info("Multivector store initialization successful")
-        else:
-            logger.error("Multivector store initialization failed")
-
-
-@app.on_event("startup")
-async def initialize_user_limits_database():
-    """Initialize user service on application startup."""
-    logger.info("Initializing user service...")
-    if settings.MODE == "cloud":
-        from core.database.user_limits_db import UserLimitsDatabase
-
-        user_limits_db = UserLimitsDatabase(uri=settings.POSTGRES_URI)
-        await user_limits_db.initialize()
-
-
-@app.on_event("startup")
-async def initialize_redis_pool():
-    """Initialize the Redis connection pool for background tasks."""
-    global redis_pool
-    logger.info("Initializing Redis connection pool...")
-
-    # Get Redis settings from configuration
-    redis_host = settings.REDIS_HOST
-    redis_port = settings.REDIS_PORT
-
-    # Log the Redis connection details
-    logger.info(f"Connecting to Redis at {redis_host}:{redis_port}")
-
-    redis_settings = arq.connections.RedisSettings(
-        host=redis_host,
-        port=redis_port,
+if settings.MODE == "cloud":
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.SESSION_SECRET_KEY,
+        same_site="none",
+        https_only=True,
     )
+else:
+    app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET_KEY)
 
-    redis_pool = await arq.create_pool(redis_settings)
-    logger.info("Redis connection pool initialized successfully")
 
+# Simple health check endpoint
+@app.get("/ping")
+async def ping_health():
+    """Simple health check endpoint that returns 200 OK."""
+    return {"status": "ok", "message": "Server is running"}
 
-@app.on_event("shutdown")
-async def close_redis_pool():
-    """Close the Redis connection pool on application shutdown."""
-    global redis_pool
-    if redis_pool:
-        logger.info("Closing Redis connection pool...")
-        redis_pool.close()
-        await redis_pool.wait_closed()
-        logger.info("Redis connection pool closed")
 
+# ---------------------------------------------------------------------------
+# Core singletons (database, vector store, storage, parser, models …)
+# ---------------------------------------------------------------------------
 
-# Initialize vector store
-if not settings.POSTGRES_URI:
-    raise ValueError("PostgreSQL URI is required for pgvector store")
 
-vector_store = PGVectorStore(
-    uri=settings.POSTGRES_URI,
-)
+# Store on app.state for later access
+app.state.document_service = document_service
+logger.info("Document service initialized and stored on app.state")
 
-# Initialize storage
-match settings.STORAGE_PROVIDER:
-    case "local":
-        storage = LocalStorage(storage_path=settings.STORAGE_PATH)
-    case "aws-s3":
-        if not settings.AWS_ACCESS_KEY or not settings.AWS_SECRET_ACCESS_KEY:
-            raise ValueError("AWS credentials are required for S3 storage")
-        storage = S3Storage(
-            aws_access_key=settings.AWS_ACCESS_KEY,
-            aws_secret_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION,
-            default_bucket=settings.S3_BUCKET,
-        )
-    case _:
-        raise ValueError(f"Unsupported storage provider: {settings.STORAGE_PROVIDER}")
+# Register ingest router
+app.include_router(ingest_router)
 
-# Initialize parser
-parser = MorphikParser(
-    chunk_size=settings.CHUNK_SIZE,
-    chunk_overlap=settings.CHUNK_OVERLAP,
-    use_unstructured_api=settings.USE_UNSTRUCTURED_API,
-    unstructured_api_key=settings.UNSTRUCTURED_API_KEY,
-    assemblyai_api_key=settings.ASSEMBLYAI_API_KEY,
-    anthropic_api_key=settings.ANTHROPIC_API_KEY,
-    use_contextual_chunking=settings.USE_CONTEXTUAL_CHUNKING,
-)
+# Single MorphikAgent instance (tool definitions cached)
+morphik_agent = MorphikAgent(document_service=document_service)
 
-# Initialize embedding model
-# Create a LiteLLM model using the registered model config
-embedding_model = LiteLLMEmbeddingModel(
-    model_key=settings.EMBEDDING_MODEL,
-)
-logger.info(f"Initialized LiteLLM embedding model with model key: {settings.EMBEDDING_MODEL}")
 
-# Initialize completion model
-# Create a LiteLLM model using the registered model config
-completion_model = LiteLLMCompletionModel(
-    model_key=settings.COMPLETION_MODEL,
-)
-logger.info(f"Initialized LiteLLM completion model with model key: {settings.COMPLETION_MODEL}")
+# Helper function to normalize folder_name parameter
+def normalize_folder_name(folder_name: Optional[Union[str, List[str]]]) -> Optional[Union[str, List[str]]]:
+    """Convert string 'null' to None for folder_name parameter."""
+    if folder_name is None:
+        return None
+    if isinstance(folder_name, str):
+        return None if folder_name.lower() == "null" else folder_name
+    if isinstance(folder_name, list):
+        return [None if f.lower() == "null" else f for f in folder_name]
+    return folder_name
 
-# Initialize reranker
-reranker = None
-if settings.USE_RERANKING:
-    match settings.RERANKER_PROVIDER:
-        case "flag":
-            reranker = FlagReranker(
-                model_name=settings.RERANKER_MODEL,
-                device=settings.RERANKER_DEVICE,
-                use_fp16=settings.RERANKER_USE_FP16,
-                query_max_length=settings.RERANKER_QUERY_MAX_LENGTH,
-                passage_max_length=settings.RERANKER_PASSAGE_MAX_LENGTH,
-            )
-        case _:
-            raise ValueError(f"Unsupported reranker provider: {settings.RERANKER_PROVIDER}")
 
-# Initialize cache factory
-cache_factory = LlamaCacheFactory(Path(settings.STORAGE_PATH))
+# Enterprise-only routes (optional)
+try:
+    from ee.routers import init_app as _init_ee_app  # type: ignore  # noqa: E402
 
-# Initialize ColPali embedding model if enabled
-colpali_embedding_model = ColpaliEmbeddingModel() if settings.ENABLE_COLPALI else None
-colpali_vector_store = MultiVectorStore(uri=settings.POSTGRES_URI) if settings.ENABLE_COLPALI else None
-
-# Initialize document service with configured components
-document_service = DocumentService(
-    storage=storage,
-    database=database,
-    vector_store=vector_store,
-    embedding_model=embedding_model,
-    completion_model=completion_model,
-    parser=parser,
-    reranker=reranker,
-    cache_factory=cache_factory,
-    enable_colpali=settings.ENABLE_COLPALI,
-    colpali_embedding_model=colpali_embedding_model,
-    colpali_vector_store=colpali_vector_store,
-)
-
-
-async def verify_token(authorization: str = Header(None)) -> AuthContext:
-    """Verify JWT Bearer token or return dev context if dev_mode is enabled."""
-    # Check if dev mode is enabled
-    if settings.dev_mode:
-        return AuthContext(
-            entity_type=EntityType(settings.dev_entity_type),
-            entity_id=settings.dev_entity_id,
-            permissions=set(settings.dev_permissions),
-            user_id=settings.dev_entity_id,  # In dev mode, entity_id is also the user_id
-        )
-
-    # Normal token verification flow
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing authorization header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    try:
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Invalid authorization header")
-
-        token = authorization[7:]  # Remove "Bearer "
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-
-        if datetime.fromtimestamp(payload["exp"], UTC) < datetime.now(UTC):
-            raise HTTPException(status_code=401, detail="Token expired")
-
-        # Support both "type" and "entity_type" fields for compatibility
-        entity_type_field = payload.get("type") or payload.get("entity_type")
-        if not entity_type_field:
-            raise HTTPException(status_code=401, detail="Missing entity type in token")
-
-        return AuthContext(
-            entity_type=EntityType(entity_type_field),
-            entity_id=payload["entity_id"],
-            app_id=payload.get("app_id"),
-            permissions=set(payload.get("permissions", ["read"])),
-            user_id=payload.get("user_id", payload["entity_id"]),  # Use user_id if available, fallback to entity_id
-        )
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-
-
-@app.post("/ingest/text", response_model=Document)
-@telemetry.track(operation_type="ingest_text", metadata_resolver=telemetry.ingest_text_metadata)
-async def ingest_text(
-    request: IngestTextRequest,
-    auth: AuthContext = Depends(verify_token),
-) -> Document:
-    """
-    Ingest a text document.
-
-    Args:
-        request: IngestTextRequest containing:
-            - content: Text content to ingest
-            - filename: Optional filename to help determine content type
-            - metadata: Optional metadata dictionary
-            - rules: Optional list of rules. Each rule should be either:
-                   - MetadataExtractionRule: {"type": "metadata_extraction", "schema": {...}}
-                   - NaturalLanguageRule: {"type": "natural_language", "prompt": "..."}
-            - folder_name: Optional folder to scope the document to
-            - end_user_id: Optional end-user ID to scope the document to
-        auth: Authentication context
-
-    Returns:
-        Document: Metadata of ingested document
-    """
-    try:
-        return await document_service.ingest_text(
-            content=request.content,
-            filename=request.filename,
-            metadata=request.metadata,
-            rules=request.rules,
-            use_colpali=request.use_colpali,
-            auth=auth,
-            folder_name=request.folder_name,
-            end_user_id=request.end_user_id,
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-
-
-# Redis pool for background tasks
-redis_pool = None
-
-
-def get_redis_pool():
-    """Get the global Redis connection pool for background tasks."""
-    return redis_pool
-
-
-@app.post("/ingest/file", response_model=Document)
-@telemetry.track(operation_type="queue_ingest_file", metadata_resolver=telemetry.ingest_file_metadata)
-async def ingest_file(
-    file: UploadFile,
-    metadata: str = Form("{}"),
-    rules: str = Form("[]"),
-    auth: AuthContext = Depends(verify_token),
-    use_colpali: Optional[bool] = None,
-    folder_name: Optional[str] = Form(None),
-    end_user_id: Optional[str] = Form(None),
-    redis: arq.ArqRedis = Depends(get_redis_pool),
-) -> Document:
-    """
-    Ingest a file document asynchronously.
-
-    Args:
-        file: File to ingest
-        metadata: JSON string of metadata
-        rules: JSON string of rules list. Each rule should be either:
-               - MetadataExtractionRule: {"type": "metadata_extraction", "schema": {...}}
-               - NaturalLanguageRule: {"type": "natural_language", "prompt": "..."}
-        auth: Authentication context
-        use_colpali: Whether to use ColPali embedding model
-        folder_name: Optional folder to scope the document to
-        end_user_id: Optional end-user ID to scope the document to
-        redis: Redis connection pool for background tasks
-
-    Returns:
-        Document with processing status that can be used to check progress
-    """
-    try:
-        # Parse metadata and rules
-        metadata_dict = json.loads(metadata)
-        rules_list = json.loads(rules)
-
-        # Fix bool conversion: ensure string "false" is properly converted to False
-        def str2bool(v):
-            return v if isinstance(v, bool) else str(v).lower() in {"true", "1", "yes"}
-
-        use_colpali = str2bool(use_colpali)
-
-        # Ensure user has write permission
-        if "write" not in auth.permissions:
-            raise PermissionError("User does not have write permission")
-
-        logger.debug(f"API: Queueing file ingestion with use_colpali: {use_colpali}")
-
-        # Create a document with processing status
-        doc = Document(
-            content_type=file.content_type,
-            filename=file.filename,
-            metadata=metadata_dict,
-            owner={"type": auth.entity_type.value, "id": auth.entity_id},
-            access_control={
-                "readers": [auth.entity_id],
-                "writers": [auth.entity_id],
-                "admins": [auth.entity_id],
-                "user_id": [auth.user_id] if auth.user_id else [],
-            },
-            system_metadata={"status": "processing"},
-        )
-
-        # Add folder_name and end_user_id to system_metadata if provided
-        if folder_name:
-            doc.system_metadata["folder_name"] = folder_name
-        if end_user_id:
-            doc.system_metadata["end_user_id"] = end_user_id
-
-        # Set processing status
-        doc.system_metadata["status"] = "processing"
-
-        # Store the document in the database
-        success = await database.store_document(doc)
-        if not success:
-            raise Exception("Failed to store document metadata")
-
-        # If folder_name is provided, ensure the folder exists and add document to it
-        if folder_name:
-            try:
-                await document_service._ensure_folder_exists(folder_name, doc.external_id, auth)
-                logger.debug(f"Ensured folder '{folder_name}' exists and contains document {doc.external_id}")
-            except Exception as e:
-                # Log error but don't raise - we want document ingestion to continue even if folder operation fails
-                logger.error(f"Error ensuring folder exists: {e}")
-
-        # Read file content
-        file_content = await file.read()
-
-        # Generate a unique key for the file
-        file_key = f"ingest_uploads/{uuid.uuid4()}/{file.filename}"
-
-        # Store the file in the configured storage
-        file_content_base64 = base64.b64encode(file_content).decode()
-        bucket, stored_key = await storage.upload_from_base64(file_content_base64, file_key, file.content_type)
-        logger.debug(f"Stored file in bucket {bucket} with key {stored_key}")
-
-        # Update document with storage info
-        doc.storage_info = {"bucket": bucket, "key": stored_key}
-
-        # Initialize storage_files array with the first file
-        from datetime import UTC, datetime
-
-        from core.models.documents import StorageFileInfo
-
-        # Create a StorageFileInfo for the initial file
-        initial_file_info = StorageFileInfo(
-            bucket=bucket,
-            key=stored_key,
-            version=1,
-            filename=file.filename,
-            content_type=file.content_type,
-            timestamp=datetime.now(UTC),
-        )
-        doc.storage_files = [initial_file_info]
-
-        # Log storage files
-        logger.debug(f"Initial storage_files for {doc.external_id}: {doc.storage_files}")
-
-        # Update both storage_info and storage_files
-        await database.update_document(
-            document_id=doc.external_id,
-            updates={"storage_info": doc.storage_info, "storage_files": doc.storage_files},
-            auth=auth,
-        )
-
-        # Convert auth context to a dictionary for serialization
-        auth_dict = {
-            "entity_type": auth.entity_type.value,
-            "entity_id": auth.entity_id,
-            "app_id": auth.app_id,
-            "permissions": list(auth.permissions),
-            "user_id": auth.user_id,
-        }
-
-        # Enqueue the background job
-        job = await redis.enqueue_job(
-            "process_ingestion_job",
-            document_id=doc.external_id,
-            file_key=stored_key,
-            bucket=bucket,
-            original_filename=file.filename,
-            content_type=file.content_type,
-            metadata_json=metadata,
-            auth_dict=auth_dict,
-            rules_list=rules_list,
-            use_colpali=use_colpali,
-            folder_name=folder_name,
-            end_user_id=end_user_id,
-        )
-
-        logger.info(f"File ingestion job queued with ID: {job.job_id} for document: {doc.external_id}")
-
-        return doc
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error during file ingestion: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error during file ingestion: {str(e)}")
-
-
-@app.post("/ingest/files", response_model=BatchIngestResponse)
-@telemetry.track(operation_type="queue_batch_ingest", metadata_resolver=telemetry.batch_ingest_metadata)
-async def batch_ingest_files(
-    files: List[UploadFile] = File(...),
-    metadata: str = Form("{}"),
-    rules: str = Form("[]"),
-    use_colpali: Optional[bool] = Form(None),
-    parallel: Optional[bool] = Form(True),
-    folder_name: Optional[str] = Form(None),
-    end_user_id: Optional[str] = Form(None),
-    auth: AuthContext = Depends(verify_token),
-    redis: arq.ArqRedis = Depends(get_redis_pool),
-) -> BatchIngestResponse:
-    """
-    Batch ingest multiple files using the task queue.
-
-    Args:
-        files: List of files to ingest
-        metadata: JSON string of metadata (either a single dict or list of dicts)
-        rules: JSON string of rules list. Can be either:
-               - A single list of rules to apply to all files
-               - A list of rule lists, one per file
-        use_colpali: Whether to use ColPali-style embedding
-        folder_name: Optional folder to scope the documents to
-        end_user_id: Optional end-user ID to scope the documents to
-        auth: Authentication context
-        redis: Redis connection pool for background tasks
-
-    Returns:
-        BatchIngestResponse containing:
-            - documents: List of created documents with processing status
-            - errors: List of errors that occurred during the batch operation
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided for batch ingestion")
-
-    try:
-        metadata_value = json.loads(metadata)
-        rules_list = json.loads(rules)
-
-        # Fix bool conversion: ensure string "false" is properly converted to False
-        def str2bool(v):
-            return str(v).lower() in {"true", "1", "yes"}
-
-        use_colpali = str2bool(use_colpali)
-
-        # Ensure user has write permission
-        if "write" not in auth.permissions:
-            raise PermissionError("User does not have write permission")
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-
-    # Validate metadata if it's a list
-    if isinstance(metadata_value, list) and len(metadata_value) != len(files):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Number of metadata items ({len(metadata_value)}) must match number of files ({len(files)})",
-        )
-
-    # Validate rules if it's a list of lists
-    if isinstance(rules_list, list) and rules_list and isinstance(rules_list[0], list):
-        if len(rules_list) != len(files):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Number of rule lists ({len(rules_list)}) must match number of files ({len(files)})",
-            )
-
-    # Convert auth context to a dictionary for serialization
-    auth_dict = {
-        "entity_type": auth.entity_type.value,
-        "entity_id": auth.entity_id,
-        "app_id": auth.app_id,
-        "permissions": list(auth.permissions),
-        "user_id": auth.user_id,
-    }
-
-    created_documents = []
-
-    try:
-        for i, file in enumerate(files):
-            # Get the metadata and rules for this file
-            metadata_item = metadata_value[i] if isinstance(metadata_value, list) else metadata_value
-            file_rules = (
-                rules_list[i]
-                if isinstance(rules_list, list) and rules_list and isinstance(rules_list[0], list)
-                else rules_list
-            )
-
-            # Create a document with processing status
-            doc = Document(
-                content_type=file.content_type,
-                filename=file.filename,
-                metadata=metadata_item,
-                owner={"type": auth.entity_type.value, "id": auth.entity_id},
-                access_control={
-                    "readers": [auth.entity_id],
-                    "writers": [auth.entity_id],
-                    "admins": [auth.entity_id],
-                    "user_id": [auth.user_id] if auth.user_id else [],
-                },
-            )
-
-            # Add folder_name and end_user_id to system_metadata if provided
-            if folder_name:
-                doc.system_metadata["folder_name"] = folder_name
-            if end_user_id:
-                doc.system_metadata["end_user_id"] = end_user_id
-
-            # Set processing status
-            doc.system_metadata["status"] = "processing"
-
-            # Store the document in the database
-            success = await database.store_document(doc)
-            if not success:
-                raise Exception(f"Failed to store document metadata for {file.filename}")
-
-            # If folder_name is provided, ensure the folder exists and add document to it
-            if folder_name:
-                try:
-                    await document_service._ensure_folder_exists(folder_name, doc.external_id, auth)
-                    logger.debug(f"Ensured folder '{folder_name}' exists and contains document {doc.external_id}")
-                except Exception as e:
-                    # Log error but don't raise - we want document ingestion to continue even if folder operation fails
-                    logger.error(f"Error ensuring folder exists: {e}")
-
-            # Read file content
-            file_content = await file.read()
-
-            # Generate a unique key for the file
-            file_key = f"ingest_uploads/{uuid.uuid4()}/{file.filename}"
-
-            # Store the file in the configured storage
-            file_content_base64 = base64.b64encode(file_content).decode()
-            bucket, stored_key = await storage.upload_from_base64(file_content_base64, file_key, file.content_type)
-            logger.debug(f"Stored file in bucket {bucket} with key {stored_key}")
-
-            # Update document with storage info
-            doc.storage_info = {"bucket": bucket, "key": stored_key}
-            await database.update_document(
-                document_id=doc.external_id, updates={"storage_info": doc.storage_info}, auth=auth
-            )
-
-            # Convert metadata to JSON string for job
-            metadata_json = json.dumps(metadata_item)
-
-            # Enqueue the background job
-            job = await redis.enqueue_job(
-                "process_ingestion_job",
-                document_id=doc.external_id,
-                file_key=stored_key,
-                bucket=bucket,
-                original_filename=file.filename,
-                content_type=file.content_type,
-                metadata_json=metadata_json,
-                auth_dict=auth_dict,
-                rules_list=file_rules,
-                use_colpali=use_colpali,
-                folder_name=folder_name,
-                end_user_id=end_user_id,
-            )
-
-            logger.info(f"File ingestion job queued with ID: {job.job_id} for document: {doc.external_id}")
-
-            # Add document to the list
-            created_documents.append(doc)
-
-        # Return information about created documents
-        return BatchIngestResponse(documents=created_documents, errors=[])
-
-    except Exception as e:
-        logger.error(f"Error queueing batch file ingestion: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error queueing batch file ingestion: {str(e)}")
+    _init_ee_app(app)  # noqa: SLF001 – runtime extension
+except ModuleNotFoundError as exc:
+    logger.debug("Enterprise package not found – running in community mode.")
+    logger.error("ModuleNotFoundError: %s", exc, exc_info=True)
+except ImportError as exc:
+    logger.error("Failed to import init_app from ee.routers: %s", exc, exc_info=True)
+except Exception as exc:  # noqa: BLE001
+    logger.error("An unexpected error occurred during EE app initialization: %s", exc, exc_info=True)
 
 
 @app.post("/retrieve/chunks", response_model=List[ChunkResult])
@@ -730,8 +214,13 @@ async def retrieve_chunks(request: RetrieveRequest, auth: AuthContext = Depends(
     Returns:
         List[ChunkResult]: List of relevant chunks
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker(f"Retrieve Chunks: '{request.query[:50]}...'")
+
     try:
-        return await document_service.retrieve_chunks(
+        # Main retrieval operation
+        perf.start_phase("document_service_retrieve_chunks")
+        results = await document_service.retrieve_chunks(
             request.query,
             auth,
             request.filters,
@@ -741,7 +230,13 @@ async def retrieve_chunks(request: RetrieveRequest, auth: AuthContext = Depends(
             request.use_colpali,
             request.folder_name,
             request.end_user_id,
+            perf,  # Pass performance tracker
         )
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)} chunks")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -767,8 +262,13 @@ async def retrieve_documents(request: RetrieveRequest, auth: AuthContext = Depen
     Returns:
         List[DocumentResult]: List of relevant documents
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker(f"Retrieve Docs: '{request.query[:50]}...'")
+
     try:
-        return await document_service.retrieve_docs(
+        # Main retrieval operation
+        perf.start_phase("document_service_retrieve_docs")
+        results = await document_service.retrieve_docs(
             request.query,
             auth,
             request.filters,
@@ -779,6 +279,11 @@ async def retrieve_documents(request: RetrieveRequest, auth: AuthContext = Depen
             request.folder_name,
             request.end_user_id,
         )
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)} documents")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -799,16 +304,39 @@ async def batch_get_documents(request: Dict[str, Any], auth: AuthContext = Depen
     Returns:
         List[Document]: List of documents matching the IDs
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker("Batch Get Documents")
+
     try:
         # Extract document_ids from request
+        perf.start_phase("request_extraction")
         document_ids = request.get("document_ids", [])
         folder_name = request.get("folder_name")
         end_user_id = request.get("end_user_id")
 
         if not document_ids:
+            perf.log_summary("No document IDs provided")
             return []
 
-        return await document_service.batch_retrieve_documents(document_ids, auth, folder_name, end_user_id)
+        # Create system filters for folder and user scoping
+        perf.start_phase("filter_creation")
+        system_filters = {}
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
+        if end_user_id:
+            system_filters["end_user_id"] = end_user_id
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
+        # Main batch retrieval operation
+        perf.start_phase("batch_retrieve_documents")
+        results = await document_service.batch_retrieve_documents(document_ids, auth, folder_name, end_user_id)
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)}/{len(document_ids)} documents")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
@@ -824,22 +352,29 @@ async def batch_get_chunks(request: Dict[str, Any], auth: AuthContext = Depends(
             - sources: List of ChunkSource objects (with document_id and chunk_number)
             - folder_name: Optional folder to scope the operation to
             - end_user_id: Optional end-user ID to scope the operation to
+            - use_colpali: Whether to use ColPali-style embedding
         auth: Authentication context
 
     Returns:
         List[ChunkResult]: List of chunk results
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker("Batch Get Chunks")
+
     try:
         # Extract sources from request
+        perf.start_phase("request_extraction")
         sources = request.get("sources", [])
         folder_name = request.get("folder_name")
         end_user_id = request.get("end_user_id")
         use_colpali = request.get("use_colpali")
 
         if not sources:
+            perf.log_summary("No sources provided")
             return []
 
         # Convert sources to ChunkSource objects if needed
+        perf.start_phase("source_conversion")
         chunk_sources = []
         for source in sources:
             if isinstance(source, dict):
@@ -847,14 +382,38 @@ async def batch_get_chunks(request: Dict[str, Any], auth: AuthContext = Depends(
             else:
                 chunk_sources.append(source)
 
-        return await document_service.batch_retrieve_chunks(chunk_sources, auth, folder_name, end_user_id, use_colpali)
+        # Create system filters for folder and user scoping
+        perf.start_phase("filter_creation")
+        system_filters = {}
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
+        if end_user_id:
+            system_filters["end_user_id"] = end_user_id
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
+        # Main batch retrieval operation
+        perf.start_phase("batch_retrieve_chunks")
+        results = await document_service.batch_retrieve_chunks(
+            chunk_sources, auth, folder_name, end_user_id, use_colpali
+        )
+
+        # Log consolidated performance summary
+        perf.log_summary(f"Retrieved {len(results)}/{len(sources)} chunks")
+
+        return results
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
 
 @app.post("/query", response_model=CompletionResponse)
 @telemetry.track(operation_type="query", metadata_resolver=telemetry.query_metadata)
-async def query_completion(request: CompletionQueryRequest, auth: AuthContext = Depends(verify_token)):
+async def query_completion(
+    request: CompletionQueryRequest,
+    auth: AuthContext = Depends(verify_token),
+    redis: arq.ArqRedis = Depends(get_redis_pool),
+):
     """
     Generate completion using relevant chunks as context.
 
@@ -878,22 +437,55 @@ async def query_completion(request: CompletionQueryRequest, auth: AuthContext = 
             - folder_name: Optional folder to scope the operation to
             - end_user_id: Optional end-user ID to scope the operation to
             - schema: Optional schema for structured output
+            - chat_id: Optional chat conversation identifier for maintaining history
         auth: Authentication context
 
     Returns:
         CompletionResponse: Generated text completion or structured output
     """
+    # Initialize performance tracker
+    perf = PerformanceTracker(f"Query: '{request.query[:50]}...'")
+
     try:
         # Validate prompt overrides before proceeding
+        perf.start_phase("prompt_validation")
         if request.prompt_overrides:
             validate_prompt_overrides_with_http_exception(request.prompt_overrides, operation_type="query")
 
+        # Chat history retrieval
+        perf.start_phase("chat_history_retrieval")
+        history_key = None
+        history: List[Dict[str, Any]] = []
+        if request.chat_id:
+            history_key = f"chat:{request.chat_id}"
+            stored = await redis.get(history_key)
+            if stored:
+                try:
+                    history = json.loads(stored)
+                except Exception:
+                    history = []
+            else:
+                db_hist = await document_service.db.get_chat_history(request.chat_id, auth.user_id, auth.app_id)
+                if db_hist:
+                    history = db_hist
+
+            history.append(
+                {
+                    "role": "user",
+                    "content": request.query,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+
         # Check query limits if in cloud mode
+        perf.start_phase("limits_check")
         if settings.MODE == "cloud" and auth.user_id:
             # Check limits before proceeding
             await check_and_increment_limits(auth, "query", 1)
 
-        return await document_service.query(
+        # Main query processing
+        perf.start_phase("document_service_query")
+        result = await document_service.query(
             request.query,
             auth,
             request.filters,
@@ -910,11 +502,205 @@ async def query_completion(request: CompletionQueryRequest, auth: AuthContext = 
             request.folder_name,
             request.end_user_id,
             request.schema,
+            history,
+            perf,  # Pass performance tracker
+            request.stream_response,
         )
+
+        # Handle streaming vs non-streaming responses
+        if request.stream_response:
+            # For streaming responses, unpack the tuple
+            response_stream, sources = result
+
+            async def generate_stream():
+                full_content = ""
+                first_token_time = None
+
+                async for chunk in response_stream:
+                    # Track time to first token
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        completion_start_to_first_token = first_token_time - perf.start_time
+                        perf.add_suboperation("completion_start_to_first_token", completion_start_to_first_token)
+                        logger.info(f"Completion start to first token: {completion_start_to_first_token:.2f}s")
+
+                    full_content += chunk
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+                # Convert sources to the format expected by frontend
+                sources_info = [
+                    {"document_id": source.document_id, "chunk_number": source.chunk_number, "score": source.score}
+                    for source in sources
+                ]
+
+                # Send completion signal with sources
+                yield f"data: {json.dumps({'done': True, 'sources': sources_info})}\n\n"
+
+                # Handle chat history after streaming is complete
+                if history_key:
+                    history.append(
+                        {
+                            "role": "assistant",
+                            "content": full_content,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                        }
+                    )
+                    await redis.set(history_key, json.dumps(history))
+                    await document_service.db.upsert_chat_history(
+                        request.chat_id,
+                        auth.user_id,
+                        auth.app_id,
+                        history,
+                    )
+
+                # Log consolidated performance summary for streaming
+                streaming_time = time.time() - first_token_time if first_token_time else 0
+                perf.add_suboperation("streaming_duration", streaming_time)
+                perf.log_summary(f"Generated streaming completion with {len(sources)} sources")
+
+            headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+            return StreamingResponse(generate_stream(), media_type="text/event-stream", headers=headers)
+        else:
+            # For non-streaming responses, result is just the CompletionResponse
+            response = result
+
+            # Chat history storage for non-streaming responses
+            perf.start_phase("chat_history_storage")
+            if history_key:
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": response.completion,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
+                )
+                await redis.set(history_key, json.dumps(history))
+                await document_service.db.upsert_chat_history(
+                    request.chat_id,
+                    auth.user_id,
+                    auth.app_id,
+                    history,
+                )
+
+            # Log consolidated performance summary
+            perf.log_summary(f"Generated completion with {len(response.sources) if response.sources else 0} sources")
+
+            return response
     except ValueError as e:
         validate_prompt_overrides_with_http_exception(operation_type="query", error=e)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+
+
+@app.get("/chat/{chat_id}", response_model=List[ChatMessage])
+async def get_chat_history(
+    chat_id: str,
+    auth: AuthContext = Depends(verify_token),
+    redis: arq.ArqRedis = Depends(get_redis_pool),
+):
+    """Retrieve the message history for a chat conversation.
+
+    Args:
+        chat_id: Identifier of the conversation whose history should be loaded.
+        auth: Authentication context used to verify access to the conversation.
+        redis: Redis connection where chat messages are stored.
+
+    Returns:
+        A list of :class:`ChatMessage` objects or an empty list if no history
+        exists.
+    """
+    history_key = f"chat:{chat_id}"
+    stored = await redis.get(history_key)
+    if not stored:
+        db_hist = await document_service.db.get_chat_history(chat_id, auth.user_id, auth.app_id)
+        if not db_hist:
+            return []
+        return [ChatMessage(**m) for m in db_hist]
+    try:
+        data = json.loads(stored)
+        return [ChatMessage(**m) for m in data]
+    except Exception:
+        return []
+
+
+@app.post("/agent", response_model=Dict[str, Any])
+@telemetry.track(operation_type="agent_query")
+async def agent_query(
+    request: AgentQueryRequest,
+    auth: AuthContext = Depends(verify_token),
+    redis: arq.ArqRedis = Depends(get_redis_pool),
+):
+    """Execute an agent-style query using the :class:`MorphikAgent`.
+
+    Args:
+        request: The query payload containing the natural language question and optional chat_id.
+        auth: Authentication context used to enforce limits and access control.
+        redis: Redis connection for chat history storage.
+
+    Returns:
+        A dictionary with the agent's full response.
+    """
+    # Chat history retrieval
+    history_key = None
+    history: List[Dict[str, Any]] = []
+    if request.chat_id:
+        history_key = f"chat:{request.chat_id}"
+        stored = await redis.get(history_key)
+        if stored:
+            try:
+                history = json.loads(stored)
+            except Exception:
+                history = []
+        else:
+            db_hist = await document_service.db.get_chat_history(request.chat_id, auth.user_id, auth.app_id)
+            if db_hist:
+                history = db_hist
+
+        history.append(
+            {
+                "role": "user",
+                "content": request.query,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    # Check free-tier agent call limits in cloud mode
+    if settings.MODE == "cloud" and auth.user_id:
+        await check_and_increment_limits(auth, "agent", 1)
+
+    # Use the shared MorphikAgent instance; per-run state is now isolated internally
+    response = await morphik_agent.run(request.query, auth, history)
+
+    # Chat history storage
+    if history_key:
+        # Store the full agent response with structured data
+        agent_message = {
+            "role": "assistant",
+            "content": response.get("response", ""),
+            "timestamp": datetime.now(UTC).isoformat(),
+            # Store agent-specific structured data
+            "agent_data": {
+                "display_objects": response.get("display_objects", []),
+                "tool_history": response.get("tool_history", []),
+                "sources": response.get("sources", []),
+            },
+        }
+        history.append(agent_message)
+        await redis.set(history_key, json.dumps(history))
+        await document_service.db.upsert_chat_history(
+            request.chat_id,
+            auth.user_id,
+            auth.app_id,
+            history,
+        )
+
+    # Return the complete response dictionary
+    return response
 
 
 @app.post("/documents", response_model=List[Document])
@@ -923,7 +709,7 @@ async def list_documents(
     skip: int = 0,
     limit: int = 10000,
     filters: Optional[Dict[str, Any]] = None,
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = Query(None),
     end_user_id: Optional[str] = None,
 ):
     """
@@ -942,17 +728,30 @@ async def list_documents(
     """
     # Create system filters for folder and user scoping
     system_filters = {}
-    if folder_name:
-        system_filters["folder_name"] = folder_name
+
+    # Normalize folder_name parameter (convert string "null" to None)
+    if folder_name is not None:
+        normalized_folder_name = normalize_folder_name(folder_name)
+        system_filters["folder_name"] = normalized_folder_name
     if end_user_id:
         system_filters["end_user_id"] = end_user_id
+    if auth.app_id:
+        system_filters["app_id"] = auth.app_id
 
     return await document_service.db.get_documents(auth, skip, limit, filters, system_filters)
 
 
 @app.get("/documents/{document_id}", response_model=Document)
 async def get_document(document_id: str, auth: AuthContext = Depends(verify_token)):
-    """Get document by ID."""
+    """Retrieve a single document by its external identifier.
+
+    Args:
+        document_id: External ID of the document to fetch.
+        auth: Authentication context used to verify access rights.
+
+    Returns:
+        The :class:`Document` metadata if found.
+    """
     try:
         doc = await document_service.db.get_document(document_id, auth)
         logger.debug(f"Found document: {doc}")
@@ -1035,7 +834,7 @@ async def delete_document(document_id: str, auth: AuthContext = Depends(verify_t
 async def get_document_by_filename(
     filename: str,
     auth: AuthContext = Depends(verify_token),
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ):
     """
@@ -1053,8 +852,9 @@ async def get_document_by_filename(
     try:
         # Create system filters for folder and user scoping
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
 
@@ -1083,6 +883,7 @@ async def update_document_text(
         document_id: ID of the document to update
         request: Text content and metadata for the update
         update_strategy: Strategy for updating the document (default: 'add')
+        auth: Authentication context
 
     Returns:
         Document: Updated document metadata
@@ -1116,7 +917,7 @@ async def update_document_file(
     metadata: str = Form("{}"),
     rules: str = Form("[]"),
     update_strategy: str = Form("add"),
-    use_colpali: Optional[bool] = None,
+    use_colpali: Optional[bool] = Form(None),
     auth: AuthContext = Depends(verify_token),
 ):
     """
@@ -1129,6 +930,7 @@ async def update_document_file(
         rules: JSON string of rules to apply to the content
         update_strategy: Strategy for updating the document (default: 'add')
         use_colpali: Whether to use multi-vector embedding
+        auth: Authentication context
 
     Returns:
         Document: Updated document metadata
@@ -1173,6 +975,7 @@ async def update_document_metadata(
     Args:
         document_id: ID of the document to update
         metadata: New metadata to merge with existing metadata
+        auth: Authentication context
 
     Returns:
         Document: Updated document metadata
@@ -1202,7 +1005,14 @@ async def update_document_metadata(
 @app.get("/usage/stats")
 @telemetry.track(operation_type="get_usage_stats", metadata_resolver=telemetry.usage_stats_metadata)
 async def get_usage_stats(auth: AuthContext = Depends(verify_token)) -> Dict[str, int]:
-    """Get usage statistics for the authenticated user."""
+    """Get usage statistics for the authenticated user.
+
+    Args:
+        auth: Authentication context identifying the caller.
+
+    Returns:
+        A mapping of operation types to token usage counts.
+    """
     if not auth.permissions or "admin" not in auth.permissions:
         return telemetry.get_user_usage(auth.entity_id)
     return telemetry.get_user_usage(auth.entity_id)
@@ -1216,7 +1026,18 @@ async def get_recent_usage(
     since: Optional[datetime] = None,
     status: Optional[str] = None,
 ) -> List[Dict]:
-    """Get recent usage records."""
+    """Retrieve recent telemetry records for the user or application.
+
+    Args:
+        auth: Authentication context; admin users receive global records.
+        operation_type: Optional operation type to filter by.
+        since: Only return records newer than this timestamp.
+        status: Optional status filter (e.g. ``success`` or ``error``).
+
+    Returns:
+        A list of usage entries sorted by timestamp, each represented as a
+        dictionary.
+    """
     if not auth.permissions or "admin" not in auth.permissions:
         records = telemetry.get_recent_usage(
             user_id=auth.entity_id, operation_type=operation_type, since=since, status=status
@@ -1249,7 +1070,19 @@ async def create_cache(
     docs: Optional[List[str]] = None,
     auth: AuthContext = Depends(verify_token),
 ) -> Dict[str, Any]:
-    """Create a new cache with specified configuration."""
+    """Create a persistent cache for low-latency completions.
+
+    Args:
+        name: Unique identifier for the cache.
+        model: The model name to use when generating completions.
+        gguf_file: Path to the ``gguf`` weights file to load.
+        filters: Optional metadata filters used to select documents.
+        docs: Explicit list of document IDs to include in the cache.
+        auth: Authentication context used for permission checks.
+
+    Returns:
+        A dictionary describing the created cache.
+    """
     try:
         # Check cache creation limits if in cloud mode
         if settings.MODE == "cloud" and auth.user_id:
@@ -1274,7 +1107,16 @@ async def create_cache(
 @app.get("/cache/{name}")
 @telemetry.track(operation_type="get_cache", metadata_resolver=telemetry.cache_get_metadata)
 async def get_cache(name: str, auth: AuthContext = Depends(verify_token)) -> Dict[str, Any]:
-    """Get cache configuration by name."""
+    """Retrieve information about a specific cache.
+
+    Args:
+        name: Name of the cache to inspect.
+        auth: Authentication context used to authorize the request.
+
+    Returns:
+        A dictionary with a boolean ``exists`` field indicating whether the
+        cache is loaded.
+    """
     try:
         exists = await document_service.load_cache(name)
         return {"exists": exists}
@@ -1285,7 +1127,15 @@ async def get_cache(name: str, auth: AuthContext = Depends(verify_token)) -> Dic
 @app.post("/cache/{name}/update")
 @telemetry.track(operation_type="update_cache", metadata_resolver=telemetry.cache_update_metadata)
 async def update_cache(name: str, auth: AuthContext = Depends(verify_token)) -> Dict[str, bool]:
-    """Update cache with new documents matching its filter."""
+    """Refresh an existing cache with newly available documents.
+
+    Args:
+        name: Identifier of the cache to update.
+        auth: Authentication context used for permission checks.
+
+    Returns:
+        A dictionary indicating whether any documents were added.
+    """
     try:
         if name not in document_service.active_caches:
             exists = await document_service.load_cache(name)
@@ -1302,7 +1152,16 @@ async def update_cache(name: str, auth: AuthContext = Depends(verify_token)) -> 
 @app.post("/cache/{name}/add_docs")
 @telemetry.track(operation_type="add_docs_to_cache", metadata_resolver=telemetry.cache_add_docs_metadata)
 async def add_docs_to_cache(name: str, docs: List[str], auth: AuthContext = Depends(verify_token)) -> Dict[str, bool]:
-    """Add specific documents to the cache."""
+    """Manually add documents to an existing cache.
+
+    Args:
+        name: Name of the target cache.
+        docs: List of document IDs to insert.
+        auth: Authentication context used for authorization.
+
+    Returns:
+        A dictionary indicating whether the documents were queued for addition.
+    """
     try:
         cache = document_service.active_caches[name]
         docs_to_add = [
@@ -1322,7 +1181,18 @@ async def query_cache(
     temperature: Optional[float] = None,
     auth: AuthContext = Depends(verify_token),
 ) -> CompletionResponse:
-    """Query the cache with a prompt."""
+    """Generate a completion using a pre-populated cache.
+
+    Args:
+        name: Name of the cache to query.
+        query: Prompt text to send to the model.
+        max_tokens: Optional maximum number of tokens to generate.
+        temperature: Optional sampling temperature for the model.
+        auth: Authentication context for permission checks.
+
+    Returns:
+        A :class:`CompletionResponse` object containing the model output.
+    """
     try:
         # Check cache query limits if in cloud mode
         if settings.MODE == "cloud" and auth.user_id:
@@ -1342,50 +1212,114 @@ async def create_graph(
     request: CreateGraphRequest,
     auth: AuthContext = Depends(verify_token),
 ) -> Graph:
-    """
-    Create a graph from documents.
+    """Create a new graph based on document contents.
 
-    This endpoint extracts entities and relationships from documents
-    matching the specified filters or document IDs and creates a graph.
+    The graph is created asynchronously. A stub graph record is returned with
+    ``status = "processing"`` while a background task extracts entities and
+    relationships.
 
     Args:
-        request: CreateGraphRequest containing:
-            - name: Name of the graph to create
-            - filters: Optional metadata filters to determine which documents to include
-            - documents: Optional list of specific document IDs to include
-            - prompt_overrides: Optional customizations for entity extraction and resolution prompts
-            - folder_name: Optional folder to scope the operation to
-            - end_user_id: Optional end-user ID to scope the operation to
-        auth: Authentication context
+        request: Graph creation parameters including name and optional filters.
+        auth: Authentication context authorizing the operation.
 
     Returns:
-        Graph: The created graph object
+        The placeholder :class:`Graph` object which clients can poll for status.
     """
     try:
         # Validate prompt overrides before proceeding
         if request.prompt_overrides:
             validate_prompt_overrides_with_http_exception(request.prompt_overrides, operation_type="graph")
 
-        # Check graph creation limits if in cloud mode
+        # Enforce usage limits (cloud mode)
         if settings.MODE == "cloud" and auth.user_id:
-            # Check limits before proceeding
             await check_and_increment_limits(auth, "graph", 1)
 
-        # Create system filters for folder and user scoping
-        system_filters = {}
-        if request.folder_name:
-            system_filters["folder_name"] = request.folder_name
+        # --------------------
+        # Build system filters
+        # --------------------
+        system_filters: Dict[str, Any] = {}
+        if request.folder_name is not None:
+            normalized_folder_name = normalize_folder_name(request.folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if request.end_user_id:
             system_filters["end_user_id"] = request.end_user_id
 
-        return await document_service.create_graph(
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
+        # --------------------
+        # Create stub graph
+        # --------------------
+        import uuid
+        from datetime import UTC, datetime
+
+        from core.models.graph import Graph
+
+        access_control = {
+            "readers": [auth.entity_id],
+            "writers": [auth.entity_id],
+            "admins": [auth.entity_id],
+        }
+        if auth.user_id:
+            access_control["user_id"] = [auth.user_id]
+
+        graph_stub = Graph(
+            id=str(uuid.uuid4()),
             name=request.name,
-            auth=auth,
             filters=request.filters,
-            documents=request.documents,
-            prompt_overrides=request.prompt_overrides,
-            system_filters=system_filters,
+            owner={"type": auth.entity_type.value, "id": auth.entity_id},
+            access_control=access_control,
         )
+
+        # Persist scoping info in system metadata
+        if system_filters.get("folder_name"):
+            graph_stub.system_metadata["folder_name"] = system_filters["folder_name"]
+        if system_filters.get("end_user_id"):
+            graph_stub.system_metadata["end_user_id"] = system_filters["end_user_id"]
+        if auth.app_id:
+            graph_stub.system_metadata["app_id"] = auth.app_id
+
+        # Mark graph as processing
+        graph_stub.system_metadata["status"] = "processing"
+        graph_stub.system_metadata["created_at"] = datetime.now(UTC)
+        graph_stub.system_metadata["updated_at"] = datetime.now(UTC)
+
+        # Store the stub graph so clients can poll for status
+        success = await document_service.db.store_graph(graph_stub)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to create graph stub")
+
+        # --------------------
+        # Background processing
+        # --------------------
+        async def _build_graph_async():
+            try:
+                await document_service.update_graph(
+                    name=request.name,
+                    auth=auth,
+                    additional_filters=None,  # original filters already on stub
+                    additional_documents=request.documents,
+                    prompt_overrides=request.prompt_overrides,
+                    system_filters=system_filters,
+                    is_initial_build=True,  # Indicate this is the initial build
+                )
+            except Exception as e:
+                logger.error(f"Graph creation failed for {request.name}: {e}")
+                # Update graph status to failed
+                existing = await document_service.db.get_graph(request.name, auth, system_filters=system_filters)
+                if existing:
+                    existing.system_metadata["status"] = "failed"
+                    existing.system_metadata["error"] = str(e)
+                    existing.system_metadata["updated_at"] = datetime.now(UTC)
+                    await document_service.db.update_graph(existing)
+
+        import asyncio
+
+        asyncio.create_task(_build_graph_async())
+
+        # Return the stub graph immediately
+        return graph_stub
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
@@ -1393,6 +1327,7 @@ async def create_graph(
 
 
 @app.post("/folders", response_model=Folder)
+@telemetry.track(operation_type="create_folder", metadata_resolver=telemetry.create_folder_metadata)
 async def create_folder(
     folder_create: FolderCreate,
     auth: AuthContext = Depends(verify_token),
@@ -1408,54 +1343,52 @@ async def create_folder(
         Folder: Created folder
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="create_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "name": folder_create.name,
+        # Create a folder object with explicit ID
+        import uuid
+
+        folder_id = str(uuid.uuid4())
+        logger.info(f"Creating folder with ID: {folder_id}, auth.user_id: {auth.user_id}")
+
+        # Set up access control with user_id
+        access_control = {
+            "readers": [auth.entity_id],
+            "writers": [auth.entity_id],
+            "admins": [auth.entity_id],
+        }
+
+        if auth.user_id:
+            access_control["user_id"] = [auth.user_id]
+            logger.info(f"Adding user_id {auth.user_id} to folder access control")
+
+        folder = Folder(
+            id=folder_id,
+            name=folder_create.name,
+            description=folder_create.description,
+            owner={
+                "type": auth.entity_type.value,
+                "id": auth.entity_id,
             },
-        ):
-            # Create a folder object with explicit ID
-            import uuid
+            access_control=access_control,
+        )
 
-            folder_id = str(uuid.uuid4())
-            logger.info(f"Creating folder with ID: {folder_id}, auth.user_id: {auth.user_id}")
+        # Scope folder to the application ID for developer tokens
+        if auth.app_id:
+            folder.system_metadata["app_id"] = auth.app_id
 
-            # Set up access control with user_id
-            access_control = {
-                "readers": [auth.entity_id],
-                "writers": [auth.entity_id],
-                "admins": [auth.entity_id],
-            }
+        # Store in database
+        success = await document_service.db.create_folder(folder)
 
-            if auth.user_id:
-                access_control["user_id"] = [auth.user_id]
-                logger.info(f"Adding user_id {auth.user_id} to folder access control")
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to create folder")
 
-            folder = Folder(
-                id=folder_id,
-                name=folder_create.name,
-                description=folder_create.description,
-                owner={
-                    "type": auth.entity_type.value,
-                    "id": auth.entity_id,
-                },
-                access_control=access_control,
-            )
-
-            # Store in database
-            success = await document_service.db.create_folder(folder)
-
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to create folder")
-
-            return folder
+        return folder
     except Exception as e:
         logger.error(f"Error creating folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/folders", response_model=List[Folder])
+@telemetry.track(operation_type="list_folders", metadata_resolver=telemetry.list_folders_metadata)
 async def list_folders(
     auth: AuthContext = Depends(verify_token),
 ) -> List[Folder]:
@@ -1469,18 +1402,15 @@ async def list_folders(
         List[Folder]: List of folders
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="list_folders",
-            user_id=auth.entity_id,
-        ):
-            folders = await document_service.db.list_folders(auth)
-            return folders
+        folders = await document_service.db.list_folders(auth)
+        return folders
     except Exception as e:
         logger.error(f"Error listing folders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/folders/{folder_id}", response_model=Folder)
+@telemetry.track(operation_type="get_folder", metadata_resolver=telemetry.get_folder_metadata)
 async def get_folder(
     folder_id: str,
     auth: AuthContext = Depends(verify_token),
@@ -1496,19 +1426,12 @@ async def get_folder(
         Folder: Folder if found and accessible
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="get_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "folder_id": folder_id,
-            },
-        ):
-            folder = await document_service.db.get_folder(folder_id, auth)
+        folder = await document_service.db.get_folder(folder_id, auth)
 
-            if not folder:
-                raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
+        if not folder:
+            raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
 
-            return folder
+        return folder
     except HTTPException:
         raise
     except Exception as e:
@@ -1516,7 +1439,63 @@ async def get_folder(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/folders/{folder_name}")
+@telemetry.track(operation_type="delete_folder", metadata_resolver=telemetry.delete_folder_metadata)
+async def delete_folder(
+    folder_name: str,
+    auth: AuthContext = Depends(verify_token),
+):
+    """
+    Delete a folder and all associated documents.
+
+    Args:
+        folder_name: Name of the folder to delete
+        auth: Authentication context (must have write access to the folder)
+
+    Returns:
+        Deletion status
+    """
+    try:
+        folder = await document_service.db.get_folder_by_name(folder_name, auth)
+        folder_id = folder.id
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+        document_ids = folder.document_ids
+        tasks = [remove_document_from_folder(folder_id, document_id, auth) for document_id in document_ids]
+        results = await asyncio.gather(*tasks)
+        stati = [res.get("status", False) for res in results]
+        if not all(stati):
+            failed = [doc for doc, stat in zip(document_ids, stati) if not stat]
+            msg = "Failed to remove the following documents from folder: " + ", ".join(failed)
+            logger.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        # folder is empty now
+        delete_tasks = [document_service.db.delete_document(document_id, auth) for document_id in document_ids]
+        stati = await asyncio.gather(*delete_tasks)
+        if not all(stati):
+            failed = [doc for doc, stat in zip(document_ids, stati) if not stat]
+            msg = "Failed to delete the following documents: " + ", ".join(failed)
+            logger.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        db: PostgresDatabase = document_service.db
+        # just remove the folder too now.
+        status = await db.delete_folder(folder_id, auth)
+        if not status:
+            logger.error(f"Failed to delete folder {folder_id}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete folder {folder_id}")
+        return {"status": "success", "message": f"Folder {folder_id} deleted successfully"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error deleting folder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/folders/{folder_id}/documents/{document_id}")
+@telemetry.track(operation_type="add_document_to_folder", metadata_resolver=telemetry.add_document_to_folder_metadata)
 async def add_document_to_folder(
     folder_id: str,
     document_id: str,
@@ -1534,26 +1513,21 @@ async def add_document_to_folder(
         Success status
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="add_document_to_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "folder_id": folder_id,
-                "document_id": document_id,
-            },
-        ):
-            success = await document_service.db.add_document_to_folder(folder_id, document_id, auth)
+        success = await document_service.db.add_document_to_folder(folder_id, document_id, auth)
 
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to add document to folder")
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to add document to folder")
 
-            return {"status": "success"}
+        return {"status": "success"}
     except Exception as e:
         logger.error(f"Error adding document to folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/folders/{folder_id}/documents/{document_id}")
+@telemetry.track(
+    operation_type="remove_document_from_folder", metadata_resolver=telemetry.remove_document_from_folder_metadata
+)
 async def remove_document_from_folder(
     folder_id: str,
     document_id: str,
@@ -1571,20 +1545,12 @@ async def remove_document_from_folder(
         Success status
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="remove_document_from_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "folder_id": folder_id,
-                "document_id": document_id,
-            },
-        ):
-            success = await document_service.db.remove_document_from_folder(folder_id, document_id, auth)
+        success = await document_service.db.remove_document_from_folder(folder_id, document_id, auth)
 
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to remove document from folder")
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to remove document from folder")
 
-            return {"status": "success"}
+        return {"status": "success"}
     except Exception as e:
         logger.error(f"Error removing document from folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1595,7 +1561,7 @@ async def remove_document_from_folder(
 async def get_graph(
     name: str,
     auth: AuthContext = Depends(verify_token),
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ) -> Graph:
     """
@@ -1615,10 +1581,15 @@ async def get_graph(
     try:
         # Create system filters for folder and user scoping
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
+
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         graph = await document_service.db.get_graph(name, auth, system_filters)
         if not graph:
@@ -1634,7 +1605,7 @@ async def get_graph(
 @telemetry.track(operation_type="list_graphs", metadata_resolver=telemetry.list_graphs_metadata)
 async def list_graphs(
     auth: AuthContext = Depends(verify_token),
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ) -> List[Graph]:
     """
@@ -1653,15 +1624,57 @@ async def list_graphs(
     try:
         # Create system filters for folder and user scoping
         system_filters = {}
-        if folder_name:
-            system_filters["folder_name"] = folder_name
+        if folder_name is not None:
+            normalized_folder_name = normalize_folder_name(folder_name)
+            system_filters["folder_name"] = normalized_folder_name
         if end_user_id:
             system_filters["end_user_id"] = end_user_id
+
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         return await document_service.db.list_graphs(auth, system_filters)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graph/{name}/visualization", response_model=Dict[str, Any])
+@telemetry.track(operation_type="get_graph_visualization", metadata_resolver=telemetry.get_graph_metadata)
+async def get_graph_visualization(
+    name: str,
+    auth: AuthContext = Depends(verify_token),
+    folder_name: Optional[Union[str, List[str]]] = None,
+    end_user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Get graph visualization data.
+
+    This endpoint retrieves the nodes and links data needed for graph visualization.
+    It works with both local and API-based graph services.
+
+    Args:
+        name: Name of the graph to visualize
+        auth: Authentication context
+        folder_name: Optional folder to scope the operation to
+        end_user_id: Optional end-user ID to scope the operation to
+
+    Returns:
+        Dict: Visualization data containing nodes and links arrays
+    """
+    try:
+        return await document_service.get_graph_visualization_data(
+            name=name,
+            auth=auth,
+            folder_name=folder_name,
+            end_user_id=end_user_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error getting graph visualization data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1704,6 +1717,10 @@ async def update_graph(
         if request.end_user_id:
             system_filters["end_user_id"] = request.end_user_id
 
+        # Developer tokens: always scope by app_id to prevent cross-app leakage
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
         return await document_service.update_graph(
             name=name,
             auth=auth,
@@ -1721,12 +1738,82 @@ async def update_graph(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/graph/workflow/{workflow_id}/status", response_model=Dict[str, Any])
+@telemetry.track(operation_type="check_workflow_status", metadata_resolver=telemetry.workflow_status_metadata)
+async def check_workflow_status(
+    workflow_id: str,
+    run_id: Optional[str] = None,
+    auth: AuthContext = Depends(verify_token),
+) -> Dict[str, Any]:
+    """Check the status of a graph build/update workflow.
+
+    This endpoint polls the external graph API to check the status of an async operation.
+
+    Args:
+        workflow_id: The workflow ID returned from build/update operations
+        run_id: Optional run ID for the specific workflow run
+        auth: Authentication context
+
+    Returns:
+        Dict containing status ('running', 'completed', or 'failed') and optional result
+    """
+    try:
+        # Get the graph service (either local or API-based)
+        graph_service = document_service.graph_service
+
+        # Check if it's the MorphikGraphService
+        from core.services.morphik_graph_service import MorphikGraphService
+
+        if isinstance(graph_service, MorphikGraphService):
+            # Use the new check_workflow_status method
+            result = await graph_service.check_workflow_status(workflow_id=workflow_id, run_id=run_id, auth=auth)
+
+            # If the workflow is completed, update the corresponding graph status
+            if result.get("status") == "completed":
+                # Extract graph_id from workflow_id (format: "build-update-{graph_name}-...")
+                # This is a simple heuristic, adjust based on actual workflow_id format
+                parts = workflow_id.split("-")
+                if len(parts) >= 3:
+                    graph_name = parts[2]
+                    try:
+                        # Find and update the graph
+                        graphs = await document_service.db.list_graphs(auth)
+                        for graph in graphs:
+                            if graph.name == graph_name or workflow_id in graph.system_metadata.get("workflow_id", ""):
+                                graph.system_metadata["status"] = "completed"
+                                # Clear workflow tracking data
+                                graph.system_metadata.pop("workflow_id", None)
+                                graph.system_metadata.pop("run_id", None)
+                                await document_service.db.update_graph(graph)
+                                break
+                    except Exception as e:
+                        logger.warning(f"Failed to update graph status after workflow completion: {e}")
+
+            return result
+        else:
+            # For local graph service, workflows complete synchronously
+            return {"status": "completed", "result": {"message": "Local graph operations complete synchronously"}}
+
+    except Exception as e:
+        logger.error(f"Error checking workflow status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/local/generate_uri", include_in_schema=True)
 async def generate_local_uri(
     name: str = Form("admin"),
     expiry_days: int = Form(30),
 ) -> Dict[str, str]:
-    """Generate a local URI for development. This endpoint is unprotected."""
+    """Generate a development URI for running Morphik locally.
+
+    Args:
+        name: Developer name to embed in the token payload.
+        expiry_days: Number of days the generated token should remain valid.
+
+    Returns:
+        A dictionary containing the ``uri`` that can be used to connect to the
+        local instance.
+    """
     try:
         # Clean name
         name = name.replace(" ", "_").lower()
@@ -1760,7 +1847,15 @@ async def generate_cloud_uri(
     request: GenerateUriRequest,
     authorization: str = Header(None),
 ) -> Dict[str, str]:
-    """Generate a URI for cloud hosted applications."""
+    """Generate an authenticated URI for a cloud-hosted Morphik application.
+
+    Args:
+        request: Parameters for URI generation including ``app_id`` and ``name``.
+        authorization: Bearer token of the user requesting the URI.
+
+    Returns:
+        A dictionary with the generated ``uri`` and associated ``app_id``.
+    """
     try:
         app_id = request.app_id
         name = request.name
@@ -2008,7 +2103,8 @@ async def set_folder_rule(
                                     )
 
                                     # Update document in database
-                                    success = await document_service.db.update_document(doc.external_id, updates, auth)
+                                    app_db = document_service.db
+                                    success = await app_db.update_document(doc.external_id, updates, auth)
 
                                     if success:
                                         logger.info(f"Updated metadata for document {doc.external_id}")
@@ -2047,3 +2143,134 @@ async def set_folder_rule(
     except Exception as e:
         logger.error(f"Error setting folder rules: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Cloud – delete application (control-plane only)
+# ---------------------------------------------------------------------------
+
+
+@app.delete("/cloud/apps")
+async def delete_cloud_app(
+    app_name: str = Query(..., description="Name of the application to delete"),
+    auth: AuthContext = Depends(verify_token),
+) -> Dict[str, Any]:
+    """Delete all resources associated with a given cloud application.
+
+    Args:
+        app_name: Name of the application whose data should be removed.
+        auth: Authentication context of the requesting user.
+
+    Returns:
+        A summary describing how many documents and folders were removed.
+    """
+
+    user_id = auth.user_id or auth.entity_id
+    logger.info(f"Deleting app {app_name} for user {user_id}")
+
+    from sqlalchemy import delete as sa_delete
+    from sqlalchemy import select
+
+    from core.models.apps import AppModel
+    from core.services.user_service import UserService
+
+    # 1) Resolve app_id from apps table ----------------------------------
+    async with document_service.db.async_session() as session:
+        stmt = select(AppModel).where(AppModel.user_id == user_id, AppModel.name == app_name)
+        res = await session.execute(stmt)
+        app_row = res.scalar_one_or_none()
+
+    if app_row is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    app_id = app_row.app_id
+
+    # ------------------------------------------------------------------
+    # Create an AuthContext scoped to *this* application so that the
+    # underlying access-control filters in the database layer allow us to
+    # see and delete resources that belong to the app – even if the JWT
+    # used to call this endpoint was scoped to a *different* app.
+    # ------------------------------------------------------------------
+
+    if auth.entity_type == EntityType.DEVELOPER:
+        app_auth = AuthContext(
+            entity_type=auth.entity_type,
+            entity_id=auth.entity_id,
+            app_id=app_id,
+            permissions=auth.permissions or {"read", "write", "admin"},
+            user_id=auth.user_id,
+        )
+    else:
+        app_auth = auth
+
+    # 2) Delete all documents for this app ------------------------------
+    # ------------------------------------------------------------------
+    # Fetch ALL documents for *this* app using the app-scoped auth.
+    # ------------------------------------------------------------------
+    doc_ids = await document_service.db.find_authorized_and_filtered_documents(app_auth)
+
+    deleted = 0
+    for doc_id in doc_ids:
+        try:
+            await document_service.delete_document(doc_id, app_auth)
+            deleted += 1
+        except Exception as exc:
+            logger.warning("Failed to delete document %s for app %s: %s", doc_id, app_id, exc)
+
+    # 3) Delete folders associated with this app -----------------------
+    # ------------------------------------------------------------------
+    # Fetch ALL folders for *this* app using the same app-scoped auth.
+    # ------------------------------------------------------------------
+    folder_ids_deleted = 0
+    folders = await document_service.db.list_folders(app_auth)
+
+    for folder in folders:
+        try:
+            await document_service.db.delete_folder(folder.id, app_auth)
+            folder_ids_deleted += 1
+        except Exception as f_exc:  # noqa: BLE001
+            logger.warning("Failed to delete folder %s for app %s: %s", folder.id, app_id, f_exc)
+
+    # 4) Remove apps table entry ---------------------------------------
+    async with document_service.db.async_session() as session:
+        await session.execute(sa_delete(AppModel).where(AppModel.app_id == app_id))
+        await session.commit()
+
+    # 5) Update user_limits --------------------------------------------
+    user_service = UserService()
+    await user_service.initialize()
+    await user_service.unregister_app(user_id, app_id)
+
+    return {
+        "app_name": app_name,
+        "status": "deleted",
+        "documents_deleted": deleted,
+        "folders_deleted": folder_ids_deleted,
+    }
+
+
+@app.get("/chats", response_model=List[Dict[str, Any]])
+async def list_chat_conversations(
+    auth: AuthContext = Depends(verify_token),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """List chat conversations available to the current user.
+
+    Args:
+        auth: Authentication context containing user and app identifiers.
+        limit: Maximum number of conversations to return (1-500)
+
+    Returns:
+        A list of dictionaries describing each conversation, ordered by most
+        recent activity.
+    """
+    try:
+        convos = await document_service.db.list_chat_conversations(
+            user_id=auth.user_id,
+            app_id=auth.app_id,
+            limit=limit,
+        )
+        return convos
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error listing chat conversations: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to list chat conversations")

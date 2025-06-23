@@ -320,7 +320,7 @@ def get_settings() -> Settings:
     # load morphik config
     morphik_config = {
         "ENABLE_COLPALI": config["morphik"]["enable_colpali"],
-        "COLPALI_MODE": config["morphik"].get("colpali_mode", "local"),
+        "COLPALI_MODE": config["morphik"].get("colpali_mode", "local") if config["morphik"]["enable_colpali"] else "off",
         "MODE": config["morphik"].get("mode", "cloud"),  # Default to "cloud" mode
         # API domain for core server
         "API_DOMAIN": config["morphik"].get("api_domain", "api.morphik.ai"),

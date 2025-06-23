@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: Optional[str] = None
     ASSEMBLYAI_API_KEY: Optional[str] = None
     HUGGING_FACE_TOKEN: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
 
     # API configuration
     HOST: str
@@ -121,6 +122,9 @@ class Settings(BaseSettings):
 
     # API configuration
     API_DOMAIN: str = "api.morphik.ai"
+
+    # PDF Viewer configuration
+    PDF_VIEWER_FRONTEND_URL: Optional[str] = "https://morphik.ai/api/pdf"
 
     # Redis configuration
     REDIS_HOST: str = "localhost"
@@ -331,6 +335,12 @@ def get_settings() -> Settings:
         "REDIS_HOST": os.environ.get("REDIS_HOST", "localhost"),
         "REDIS_PORT": int(os.environ.get("REDIS_PORT", 6379)),
     }
+    # load pdf viewer config
+    pdf_viewer_config = {}
+    if "pdf_viewer" in config:
+        pdf_viewer_config = {
+            "PDF_VIEWER_FRONTEND_URL": config["pdf_viewer"].get("frontend_url", "https://morphik.ai/api/pdf")
+        }
 
     # load graph config
     graph_config = (
@@ -389,6 +399,7 @@ def get_settings() -> Settings:
             vector_store_config,
             rules_config,
             morphik_config,
+            pdf_viewer_config,
             redis_config,
             graph_config,
             document_analysis_config,

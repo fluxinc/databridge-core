@@ -5,23 +5,24 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { Info, Calendar, Clock } from "lucide-react";
+import { Info, Calendar, Clock, Copy, Check } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import Image from "next/image";
 import DeleteConfirmationModal from "./DeleteConfirmationModal";
 
-import { Document, Folder } from "@/components/types";
+import { Document, FolderSummary } from "@/components/types";
 
 interface DocumentDetailProps {
   selectedDocument: Document | null;
   handleDeleteDocument: (documentId: string) => Promise<void>;
-  folders: Folder[];
+  folders: FolderSummary[];
   apiBaseUrl: string;
   authToken: string | null;
   refreshDocuments: () => void;
   refreshFolders: () => void;
   loading: boolean;
   onClose: () => void;
+  onViewInPDFViewer?: (documentId: string) => void; // Add navigation callback
 }
 
 const DocumentDetail: React.FC<DocumentDetailProps> = ({
@@ -34,9 +35,11 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
   refreshFolders,
   loading,
   onClose,
+  onViewInPDFViewer,
 }) => {
   const [isMovingToFolder, setIsMovingToFolder] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [copiedDocumentId, setCopiedDocumentId] = useState(false);
 
   if (!selectedDocument) {
     return (
@@ -51,6 +54,7 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
 
   const currentFolder = selectedDocument.system_metadata?.folder_name as string | undefined;
   const status = selectedDocument.system_metadata?.status as string | undefined;
+  const error = selectedDocument.system_metadata?.error as string | undefined;
   const createdAt = selectedDocument.system_metadata?.created_at as string | undefined;
   const updatedAt = selectedDocument.system_metadata?.updated_at as string | undefined;
   const version = selectedDocument.system_metadata?.version as number | undefined;
@@ -63,6 +67,17 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
       return date.toLocaleString();
     } catch {
       return dateString;
+    }
+  };
+
+  // Copy document ID to clipboard
+  const copyDocumentId = async () => {
+    try {
+      await navigator.clipboard.writeText(selectedDocument.external_id);
+      setCopiedDocumentId(true);
+      setTimeout(() => setCopiedDocumentId(false), 2000); // Reset after 2 seconds
+    } catch (err) {
+      console.error("Failed to copy document ID:", err);
     }
   };
 
@@ -154,7 +169,7 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
   return (
     <div className="rounded-lg border">
       <div className="sticky top-0 flex items-center justify-between border-b bg-muted px-4 py-3">
-        <h3 className="text-lg font-semibold">Document Details</h3>
+        <h3 className="text-sm font-semibold">Document Details</h3>
         <Button variant="ghost" size="icon" onClick={onClose} className="rounded-full hover:bg-background/80">
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -191,6 +206,42 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
               {getStatusBadge(status)}
             </div>
           </div>
+
+          {/* Error message for failed documents */}
+          {status === "failed" && error && (
+            <div className="rounded-lg bg-red-50 p-3 dark:bg-red-950/20">
+              <h3 className="mb-1 font-medium text-red-800 dark:text-red-200">Error</h3>
+              <p className="text-sm text-red-700 dark:text-red-300">{error}</p>
+            </div>
+          )}
+
+          {/* PDF Viewer Button - only show for PDF documents */}
+          {selectedDocument.content_type === "application/pdf" && onViewInPDFViewer && (
+            <div>
+              <Button
+                onClick={() => onViewInPDFViewer(selectedDocument.external_id)}
+                className="w-full"
+                disabled={loading}
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="mr-2"
+                >
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                  <polyline points="14 2 14 8 20 8"></polyline>
+                </svg>
+                View in PDF Viewer
+              </Button>
+            </div>
+          )}
 
           <div>
             <h3 className="mb-1 font-medium">Folder</h3>
@@ -235,7 +286,18 @@ const DocumentDetail: React.FC<DocumentDetailProps> = ({
 
           <div>
             <h3 className="mb-1 font-medium">Document ID</h3>
-            <p className="font-mono text-xs">{selectedDocument.external_id}</p>
+            <button
+              onClick={copyDocumentId}
+              className="group flex items-center gap-2 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
+              title="Click to copy Document ID"
+            >
+              <span>{selectedDocument.external_id}</span>
+              {copiedDocumentId ? (
+                <Check className="h-3 w-3 text-green-500" />
+              ) : (
+                <Copy className="h-3 w-3 opacity-0 transition-opacity group-hover:opacity-100" />
+              )}
+            </button>
           </div>
 
           {version !== undefined && (

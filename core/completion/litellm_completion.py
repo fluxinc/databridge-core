@@ -283,7 +283,7 @@ class LiteLLMCompletionModel(BaseCompletionModel):
 
             # Extract model configuration
             model = self.model_config.get("model_name")
-            model_kwargs = {k: v for k, v in self.model_config.items() if k != "model_name"}
+            model_kwargs = {k: v for k, v in self.model_config.items() if k not in ["model_name", "vision"]}
 
             # Override with completion request parameters
             if request.temperature is not None:
@@ -403,7 +403,7 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         }
 
         for key, value in self.model_config.items():
-            if key != "model_name":
+            if key not in ["model_name", "vision"]:  # Exclude 'vision'
                 model_params[key] = value
 
         logger.debug(f"Calling LiteLLM with params: {model_params}")

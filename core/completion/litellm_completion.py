@@ -420,6 +420,9 @@ class LiteLLMCompletionModel(BaseCompletionModel):
             if key not in ["model", "model_name"]:
                 model_params[key] = value
 
+        # Pop the vision key as it's not a standard litellm parameter
+        model_params.pop("vision", None)
+
         logger.debug(f"Calling LiteLLM with params: {model_params}")
         response = await litellm.acompletion(**model_params)
 
@@ -475,6 +478,9 @@ class LiteLLMCompletionModel(BaseCompletionModel):
         for key, value in config.items():
             if key not in ["model", "model_name"]:
                 model_params[key] = value
+
+        # Pop the vision key as it's not a standard litellm parameter
+        model_params.pop("vision", None)
 
         logger.debug(f"Calling LiteLLM streaming with params: {model_params}")
         response = await litellm.acompletion(**model_params)

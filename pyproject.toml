@@ -1,13 +1,3 @@
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
-[project]
-name = "morphik-local-dev"
-version = "0.1.0"
-description = "Local development project"
-authors = [{name = "Dev", email = "dev@example.com"}]
-
 [tool.isort]
 profile = "black"
 line_length = 120
@@ -26,10 +16,3 @@ ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"] # Ignore unused imports in __init__.py files
-
-[tool.poetry]
-name = "morphik"
-packages = [
-    { include = "core" },
-    { include = "sdks" },
-]

@@ -251,6 +251,12 @@ def main():
         action="store_true",
         help="Skip Ollama availability check",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for Uvicorn (default: CPU count)",
+    )
     args = parser.parse_args()
 
     # Set up logging first with specified level
@@ -292,8 +298,8 @@ def main():
     # Load settings (this will validate all required env vars)
     settings = get_settings()
 
-    # Wait for Redis to be available (using environment variables or defaults)
-    redis_host = os.environ.get("REDIS_HOST", "127.0.0.1")
+    # Wait for Redis to be available (using environment variables)
+    redis_host = os.environ.get("REDIS_HOST", "localhost")
     redis_port = int(os.environ.get("REDIS_PORT", "6379"))
     if not wait_for_redis(host=redis_host, port=redis_port):
         logging.error("Cannot start server without Redis. Please ensure Redis is running.")
@@ -310,6 +316,7 @@ def main():
         port=settings.PORT,
         loop="asyncio",
         log_level=args.log,
+        workers=args.workers,
         # reload=settings.RELOAD # Reload might interfere with subprocess management
     )
 

@@ -18,15 +18,16 @@ from core.agent import MorphikAgent
 from core.app_factory import lifespan
 from core.auth_utils import verify_token
 from core.config import get_settings
-from core.logging_config import setup_logging
 from core.database.postgres_database import PostgresDatabase
 from core.dependencies import get_redis_pool
 from core.limits_utils import check_and_increment_limits
+from core.logging_config import setup_logging
+from core.middleware.profiling import ProfilingMiddleware
 from core.models.auth import AuthContext, EntityType
 from core.models.chat import ChatMessage
 from core.models.completion import ChunkSource, CompletionResponse
 from core.models.documents import ChunkResult, Document, DocumentResult
-from core.models.folders import Folder, FolderCreate
+from core.models.folders import Folder, FolderCreate, FolderSummary
 from core.models.graph import Graph
 from core.models.prompts import validate_prompt_overrides_with_http_exception
 from core.models.request import (
@@ -39,7 +40,10 @@ from core.models.request import (
     SetFolderRuleRequest,
     UpdateGraphRequest,
 )
+from core.routes.document import router as document_router
 from core.routes.ingest import router as ingest_router
+from core.routes.model_config import router as model_config_router
+from core.routes.models import router as models_router
 from core.services.telemetry import TelemetryService
 from core.services_init import document_service
 
@@ -104,6 +108,12 @@ class PerformanceTracker:
 
 app = FastAPI(lifespan=lifespan)
 
+# --------------------------------------------------------
+# Optional per-request profiler (ENABLE_PROFILING=1)
+# --------------------------------------------------------
+
+app.add_middleware(ProfilingMiddleware)
+
 # Add CORS middleware (same behaviour as before refactor)
 app.add_middleware(
     CORSMiddleware,
@@ -151,6 +161,72 @@ async def ping_health():
     return {"status": "ok", "message": "Server is running"}
 
 
+@app.get("/models")
+async def get_available_models(auth: AuthContext = Depends(verify_token)):
+    """
+    Get list of available models from configuration.
+    
+    Returns models grouped by type (chat, embedding, etc.) with their metadata.
+    """
+    try:
+        # Load the morphik.toml file to get registered models
+        with open("morphik.toml", "rb") as f:
+            config = tomli.load(f)
+        
+        registered_models = config.get("registered_models", {})
+        
+        # Group models by their purpose
+        chat_models = []
+        embedding_models = []
+        
+        for model_key, model_config in registered_models.items():
+            model_info = {
+                "id": model_key,
+                "model": model_config.get("model_name", model_key),
+                "provider": _extract_provider(model_config.get("model_name", "")),
+                "config": model_config
+            }
+            
+            # Categorize models based on their names or configuration
+            if "embedding" in model_key.lower():
+                embedding_models.append(model_info)
+            else:
+                chat_models.append(model_info)
+        
+        # Also add the default configured models
+        default_models = {
+            "completion": config.get("completion", {}).get("model"),
+            "agent": config.get("agent", {}).get("model"),
+            "embedding": config.get("embedding", {}).get("model"),
+        }
+        
+        return {
+            "chat_models": chat_models,
+            "embedding_models": embedding_models,
+            "default_models": default_models,
+            "providers": ["openai", "anthropic", "google", "azure", "ollama", "custom"]
+        }
+    except Exception as e:
+        logger.error(f"Error loading models: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load available models")
+
+
+def _extract_provider(model_name: str) -> str:
+    """Extract provider from model name."""
+    if model_name.startswith("gpt"):
+        return "openai"
+    elif model_name.startswith("claude"):
+        return "anthropic"
+    elif model_name.startswith("gemini"):
+        return "google"
+    elif model_name.startswith("ollama"):
+        return "ollama"
+    elif "azure" in model_name:
+        return "azure"
+    else:
+        return "custom"
+
+
 # ---------------------------------------------------------------------------
 # Core singletons (database, vector store, storage, parser, models …)
 # ---------------------------------------------------------------------------
@@ -162,6 +238,15 @@ logger.info("Document service initialized and stored on app.state")
 
 # Register ingest router
 app.include_router(ingest_router)
+
+# Register document router
+app.include_router(document_router)
+
+# Register model config router
+app.include_router(model_config_router)
+
+# Register models router
+app.include_router(models_router)
 
 # Single MorphikAgent instance (tool definitions cached)
 morphik_agent = MorphikAgent(document_service=document_service)
@@ -505,6 +590,7 @@ async def query_completion(
             history,
             perf,  # Pass performance tracker
             request.stream_response,
+            request.llm_config,
         )
 
         # Handle streaming vs non-streaming responses
@@ -525,7 +611,7 @@ async def query_completion(
                         logger.info(f"Completion start to first token: {completion_start_to_first_token:.2f}s")
 
                     full_content += chunk
-                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+                    yield f"data: {json.dumps({'type': 'assistant', 'content': chunk})}\n\n"
 
                 # Convert sources to the format expected by frontend
                 sources_info = [
@@ -534,7 +620,7 @@ async def query_completion(
                 ]
 
                 # Send completion signal with sources
-                yield f"data: {json.dumps({'done': True, 'sources': sources_info})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'sources': sources_info})}\n\n"
 
                 # Handle chat history after streaming is complete
                 if history_key:
@@ -626,6 +712,93 @@ async def get_chat_history(
         return [ChatMessage(**m) for m in data]
     except Exception:
         return []
+
+
+@app.get("/models/available")
+async def get_available_models_for_selection(auth: AuthContext = Depends(verify_token)):
+    """Get list of available models for UI selection.
+    
+    Returns a list of models that can be used for queries. Each model includes:
+    - id: Model identifier to use in llm_config
+    - name: Display name for the model
+    - provider: The LLM provider (e.g., openai, anthropic, ollama)
+    - description: Optional description of the model
+    """
+    # For now, return some common models that work with LiteLLM
+    # In the future, this could be configurable or dynamically determined
+    models = [
+        {
+            "id": "gpt-4o",
+            "name": "GPT-4o",
+            "provider": "openai",
+            "description": "OpenAI's most capable model with vision support"
+        },
+        {
+            "id": "gpt-4o-mini",
+            "name": "GPT-4o Mini",
+            "provider": "openai",
+            "description": "Faster, more affordable GPT-4o variant"
+        },
+        {
+            "id": "claude-3-5-sonnet-20241022",
+            "name": "Claude 3.5 Sonnet",
+            "provider": "anthropic",
+            "description": "Anthropic's most intelligent model"
+        },
+        {
+            "id": "claude-3-5-haiku-20241022",
+            "name": "Claude 3.5 Haiku",
+            "provider": "anthropic",
+            "description": "Fast and affordable Claude model"
+        },
+        {
+            "id": "gemini/gemini-1.5-pro",
+            "name": "Gemini 1.5 Pro",
+            "provider": "google",
+            "description": "Google's advanced model with long context"
+        },
+        {
+            "id": "gemini/gemini-1.5-flash",
+            "name": "Gemini 1.5 Flash",
+            "provider": "google",
+            "description": "Fast and efficient Gemini model"
+        },
+        {
+            "id": "deepseek/deepseek-chat",
+            "name": "DeepSeek Chat",
+            "provider": "deepseek",
+            "description": "DeepSeek's conversational AI model"
+        },
+        {
+            "id": "groq/llama-3.3-70b-versatile",
+            "name": "Llama 3.3 70B",
+            "provider": "groq",
+            "description": "Fast inference with Groq"
+        },
+        {
+            "id": "groq/llama-3.1-8b-instant",
+            "name": "Llama 3.1 8B",
+            "provider": "groq",
+            "description": "Ultra-fast small model on Groq"
+        }
+    ]
+    
+    # Check if there's a configured model in settings to add to the list
+    if hasattr(settings, "COMPLETION_MODEL") and hasattr(settings, "REGISTERED_MODELS"):
+        configured_model = settings.COMPLETION_MODEL
+        if configured_model in settings.REGISTERED_MODELS:
+            config = settings.REGISTERED_MODELS[configured_model]
+            model_name = config.get("model_name", configured_model)
+            # Add the configured model if it's not already in the list
+            if not any(m["id"] == model_name for m in models):
+                models.insert(0, {
+                    "id": model_name,
+                    "name": f"{configured_model} (Configured)",
+                    "provider": "configured",
+                    "description": "Currently configured model in morphik.toml"
+                })
+    
+    return {"models": models}
 
 
 @app.post("/agent", response_model=Dict[str, Any])
@@ -866,6 +1039,118 @@ async def get_document_by_filename(
     except HTTPException as e:
         logger.error(f"Error getting document by filename: {e}")
         raise e
+
+
+@app.get("/documents/{document_id}/download_url")
+async def get_document_download_url(
+    document_id: str,
+    auth: AuthContext = Depends(verify_token),
+    expires_in: int = Query(3600, description="URL expiration time in seconds"),
+):
+    """
+    Get a download URL for a specific document.
+
+    Args:
+        document_id: External ID of the document
+        auth: Authentication context
+        expires_in: URL expiration time in seconds (default: 1 hour)
+
+    Returns:
+        Dictionary containing the download URL and metadata
+    """
+    try:
+        # Get the document
+        doc = await document_service.db.get_document(document_id, auth)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Check if document has storage info
+        if not doc.storage_info or not doc.storage_info.get("bucket") or not doc.storage_info.get("key"):
+            raise HTTPException(status_code=404, detail="Document file not found in storage")
+
+        # Generate download URL
+        download_url = await document_service.storage.get_download_url(
+            doc.storage_info["bucket"], doc.storage_info["key"], expires_in=expires_in
+        )
+
+        return {
+            "document_id": doc.external_id,
+            "filename": doc.filename,
+            "content_type": doc.content_type,
+            "download_url": download_url,
+            "expires_in": expires_in,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting download URL for document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting download URL: {str(e)}")
+
+
+@app.get("/documents/{document_id}/file")
+async def download_document_file(document_id: str, auth: AuthContext = Depends(verify_token)):
+    """
+    Download the actual file content for a document.
+    This endpoint is used for local storage when file:// URLs cannot be accessed by browsers.
+
+    Args:
+        document_id: External ID of the document
+        auth: Authentication context
+
+    Returns:
+        StreamingResponse with the file content
+    """
+    try:
+        logger.info(f"Attempting to download file for document ID: {document_id}")
+        logger.info(f"Auth context: entity_id={auth.entity_id}, app_id={auth.app_id}")
+
+        # Get the document
+        doc = await document_service.db.get_document(document_id, auth)
+        logger.info(f"Document lookup result: {doc is not None}")
+
+        if not doc:
+            logger.warning(f"Document not found in database: {document_id}")
+            raise HTTPException(status_code=404, detail=f"Document not found: {document_id}")
+
+        logger.info(f"Found document: {doc.filename}, content_type: {doc.content_type}")
+        logger.info(f"Storage info: {doc.storage_info}")
+
+        # Check if document has storage info
+        if not doc.storage_info or not doc.storage_info.get("bucket") or not doc.storage_info.get("key"):
+            logger.warning(f"Document has no storage info: {document_id}")
+            raise HTTPException(status_code=404, detail="Document file not found in storage")
+
+        # Download file content from storage
+        logger.info(f"Downloading from bucket: {doc.storage_info['bucket']}, key: {doc.storage_info['key']}")
+        file_content = await document_service.storage.download_file(doc.storage_info["bucket"], doc.storage_info["key"])
+
+        logger.info(f"Successfully downloaded {len(file_content)} bytes")
+
+        # Create streaming response
+
+        from fastapi.responses import StreamingResponse
+
+        def generate():
+            yield file_content
+
+        return StreamingResponse(
+            generate(),
+            media_type=doc.content_type or "application/octet-stream",
+            headers={
+                "Content-Disposition": f"inline; filename=\"{doc.filename or 'document'}\"",
+                "Content-Length": str(len(file_content)),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        logger.error(f"File not found in storage for document {document_id}: {e}")
+        raise HTTPException(status_code=404, detail=f"File not found in storage: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error downloading document file {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
 
 
 @app.post("/documents/{document_id}/update_text", response_model=Document)
@@ -1407,6 +1692,19 @@ async def list_folders(
     except Exception as e:
         logger.error(f"Error listing folders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/folders/summary", response_model=List[FolderSummary])
+@telemetry.track(operation_type="list_folders_summary")
+async def list_folder_summaries(auth: AuthContext = Depends(verify_token)) -> List[FolderSummary]:
+    """Return compact folder list (id, name, doc_count, updated_at)."""
+
+    try:
+        summaries = await document_service.db.list_folders_summary(auth)
+        return summaries  # type: ignore[return-value]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error listing folder summaries: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/folders/{folder_id}", response_model=Folder)

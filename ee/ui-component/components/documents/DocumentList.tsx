@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Badge } from "@/components/ui/badge";
+
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,11 +15,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Plus, Wand2, Upload, Filter } from "lucide-react";
+import { Plus, Wand2, Upload, Filter, Eye, Download, Trash2, Copy, Check } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { showAlert } from "@/components/ui/alert-system";
 
-import { Document, Folder } from "@/components/types";
+import { Document, Folder, FolderSummary } from "@/components/types";
 
 type ColumnType = "string" | "int" | "float" | "bool" | "Date" | "json";
 
@@ -48,6 +48,10 @@ interface DocumentListProps {
   apiBaseUrl: string;
   authToken: string | null;
   selectedFolder?: string | null;
+  onViewInPDFViewer?: (documentId: string) => void; // Add PDF viewer navigation
+  onDownloadDocument?: (documentId: string) => void; // Add download functionality
+  onDeleteDocument?: (documentId: string) => void; // Add delete functionality
+  folders?: FolderSummary[]; // Optional since it's fetched internally
 }
 
 // Filter Dialog Component
@@ -265,7 +269,7 @@ const AddColumnDialog = ({
   );
 };
 
-const DocumentList: React.FC<DocumentListProps> = ({
+const DocumentList: React.FC<DocumentListProps> = React.memo(function DocumentList({
   documents,
   selectedDocument,
   selectedDocuments,
@@ -278,33 +282,40 @@ const DocumentList: React.FC<DocumentListProps> = ({
   apiBaseUrl,
   authToken,
   selectedFolder,
-}) => {
+  onViewInPDFViewer,
+  onDownloadDocument,
+  onDeleteDocument,
+}) {
   const [customColumns, setCustomColumns] = useState<CustomColumn[]>([]);
   const [showAddColumnDialog, setShowAddColumnDialog] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
   const [showFilterDialog, setShowFilterDialog] = useState(false);
   const [filterValues, setFilterValues] = useState<Record<string, string>>({});
-  const [filteredDocuments, setFilteredDocuments] = useState<Document[]>([]);
+  const [copiedDocumentId, setCopiedDocumentId] = useState<string | null>(null);
 
-  // Get unique metadata fields from all documents
-  const existingMetadataFields = React.useMemo(() => {
+  // Get unique metadata fields from all documents, excluding external_id
+  const existingMetadataFields = useMemo(() => {
     const fields = new Set<string>();
     documents.forEach(doc => {
       if (doc.metadata) {
-        Object.keys(doc.metadata).forEach(key => fields.add(key));
+        Object.keys(doc.metadata).forEach(key => {
+          // Filter out external_id since we have a dedicated Document ID column
+          if (key !== "external_id") {
+            fields.add(key);
+          }
+        });
       }
     });
     return Array.from(fields);
   }, [documents]);
 
-  // Apply filter logic
-  useEffect(() => {
+  // Apply filter logic with memoization
+  const filteredDocuments = useMemo(() => {
     if (Object.keys(filterValues).length === 0) {
-      setFilteredDocuments(documents);
-      return;
+      return documents;
     }
 
-    const filtered = documents.filter(doc => {
+    return documents.filter(doc => {
       // Check if document matches all filter criteria
       return Object.entries(filterValues).every(([key, value]) => {
         if (!value || value.trim() === "") return true; // Skip empty filters
@@ -316,12 +327,22 @@ const DocumentList: React.FC<DocumentListProps> = ({
         return String(docValue).toLowerCase().includes(value.toLowerCase());
       });
     });
-
-    setFilteredDocuments(filtered);
   }, [documents, filterValues]);
 
+  // Copy document ID to clipboard
+  const copyDocumentId = async (documentId: string) => {
+    try {
+      await navigator.clipboard.writeText(documentId);
+      setCopiedDocumentId(documentId);
+      setTimeout(() => setCopiedDocumentId(null), 2000); // Reset after 2 seconds
+    } catch (err) {
+      console.error("Failed to copy document ID:", err);
+      showAlert("Failed to copy document ID", { type: "error", duration: 3000 });
+    }
+  };
+
   // Combine existing metadata fields with custom columns
-  const allColumns = React.useMemo(() => {
+  const allColumns = useMemo(() => {
     const metadataColumns: CustomColumn[] = existingMetadataFields.map(field => ({
       name: field,
       description: `Extracted ${field}`,
@@ -342,13 +363,12 @@ const DocumentList: React.FC<DocumentListProps> = ({
     return mergedColumns;
   }, [existingMetadataFields, customColumns]);
 
-  const handleAddColumn = (column: CustomColumn) => {
-    setCustomColumns([...customColumns, column]);
-  };
+  const handleAddColumn = useCallback((column: CustomColumn) => {
+    setCustomColumns(prev => [...prev, column]);
+  }, []);
 
   // Handle data extraction
-
-  const handleExtract = async () => {
+  const handleExtract = useCallback(async () => {
     // First, find the folder object to get its ID
     if (!selectedFolder || customColumns.length === 0) {
       console.error("Cannot extract: No folder selected or no columns defined");
@@ -360,7 +380,7 @@ const DocumentList: React.FC<DocumentListProps> = ({
       setIsExtracting(true);
 
       // First, get folders to find the current folder ID
-      const foldersResponse = await fetch(`${apiBaseUrl}/folders`, {
+      const foldersResponse = await fetch(`${apiBaseUrl}/folders/summary`, {
         headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
       });
 
@@ -369,10 +389,22 @@ const DocumentList: React.FC<DocumentListProps> = ({
       }
 
       const folders = await foldersResponse.json();
-      const currentFolder = folders.find((folder: Folder) => folder.name === selectedFolder);
+      const currentFolder = folders.find((folder: FolderSummary) => folder.name === selectedFolder);
 
       if (!currentFolder) {
         throw new Error(`Folder "${selectedFolder}" not found`);
+      }
+
+      // Ensure we have document_ids – fetch folder detail if missing
+      let docIds: string[] = Array.isArray(currentFolder.document_ids) ? currentFolder.document_ids : [];
+      if (docIds.length === 0) {
+        const detailRes = await fetch(`${apiBaseUrl}/folders/${currentFolder.id}`, {
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        });
+        if (detailRes.ok) {
+          const detail: Folder = await detailRes.json();
+          docIds = Array.isArray(detail.document_ids) ? detail.document_ids : [];
+        }
       }
 
       // Convert columns to metadata extraction rule
@@ -421,7 +453,7 @@ const DocumentList: React.FC<DocumentListProps> = ({
         try {
           console.log("Performing fresh refresh after setting extraction rule");
           // Clear folder data to force a clean refresh
-          const folderResponse = await fetch(`${apiBaseUrl}/folders`, {
+          const folderResponse = await fetch(`${apiBaseUrl}/folders/summary`, {
             method: "GET",
             headers: {
               ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
@@ -438,14 +470,22 @@ const DocumentList: React.FC<DocumentListProps> = ({
           // Now fetch documents based on the current folder
           if (selectedFolder && selectedFolder !== "all") {
             // Find the folder by name
-            const targetFolder = freshFolders.find((folder: Folder) => folder.name === selectedFolder);
+            const targetFolder = freshFolders.find((folder: FolderSummary) => folder.name === selectedFolder);
 
             if (targetFolder) {
               console.log(`Rule: Found folder ${targetFolder.name} in fresh data`);
 
-              // Get the document IDs from the folder
-              const documentIds = Array.isArray(targetFolder.document_ids) ? targetFolder.document_ids : [];
-              console.log(`Rule: Folder has ${documentIds.length} documents`);
+              // Ensure we have document IDs (may be missing in summary response)
+              let documentIds = Array.isArray(targetFolder.document_ids) ? targetFolder.document_ids : [];
+              if (documentIds.length === 0 && targetFolder.id) {
+                const detResp = await fetch(`${apiBaseUrl}/folders/${targetFolder.id}`, {
+                  headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+                });
+                if (detResp.ok) {
+                  const det: Folder = await detResp.json();
+                  documentIds = Array.isArray(det.document_ids) ? det.document_ids : [];
+                }
+              }
 
               if (documentIds.length > 0) {
                 // Fetch document details for the IDs
@@ -517,91 +557,75 @@ const DocumentList: React.FC<DocumentListProps> = ({
     } finally {
       setIsExtracting(false);
     }
-  };
+  }, [selectedFolder, customColumns, apiBaseUrl, authToken, setDocuments]);
 
   // Calculate how many filters are currently active
-  const activeFilterCount = Object.values(filterValues).filter(v => v && v.trim() !== "").length;
+  const activeFilterCount = useMemo(
+    () => Object.values(filterValues).filter(v => v && v.trim() !== "").length,
+    [filterValues]
+  );
 
   const DocumentListHeader = () => {
     return (
       <div className="relative sticky top-0 z-10 border-b bg-muted font-medium">
-        <div
-          className="grid w-full items-center"
-          style={{
-            gridTemplateColumns: `48px minmax(200px, 350px) 100px 120px ${allColumns.map(() => "140px").join(" ")}`,
-          }}
-        >
-          <div className="flex items-center justify-center p-3">
-            <Checkbox
-              id="select-all-documents"
-              checked={getSelectAllState()}
-              onCheckedChange={checked => {
-                if (checked) {
-                  setSelectedDocuments(documents.map(doc => doc.external_id));
-                } else {
-                  setSelectedDocuments([]);
-                }
-              }}
-              aria-label="Select all documents"
-            />
-          </div>
-          <div className="p-3 text-sm font-semibold">Filename</div>
-          <div className="p-3 text-sm font-semibold">Type</div>
-          <div className="p-3 text-sm font-semibold">
-            <div className="group relative inline-flex items-center">
-              Status
-              <span className="ml-1 cursor-help text-muted-foreground">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <circle cx="12" cy="12" r="10"></circle>
-                  <line x1="12" y1="16" x2="12" y2="12"></line>
-                  <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                </svg>
-              </span>
-              <div className="absolute left-0 top-6 z-[100] hidden w-64 rounded-md border bg-background p-3 text-xs text-foreground shadow-lg group-hover:block">
-                Documents with &quot;Processing&quot; status are queryable, but visual features like direct visual
-                context will only be available after processing completes.
-              </div>
+        <div className="flex w-full">
+          {/* Main scrollable content */}
+          <div
+            className="grid flex-1 items-center"
+            style={{
+              gridTemplateColumns: `48px minmax(200px, 350px) 160px ${allColumns.map(() => "140px").join(" ")}`,
+            }}
+          >
+            <div className="flex items-center justify-center px-3 py-2">
+              <Checkbox
+                id="select-all-documents"
+                checked={getSelectAllState()}
+                onCheckedChange={checked => {
+                  if (checked) {
+                    setSelectedDocuments(documents.map(doc => doc.external_id));
+                  } else {
+                    setSelectedDocuments([]);
+                  }
+                }}
+                aria-label="Select all documents"
+              />
             </div>
-          </div>
-          {allColumns.map(column => (
-            <div key={column.name} className="p-3 text-sm font-semibold">
-              <div className="group relative inline-flex items-center">
-                {column.name}
-                <span className="ml-1 cursor-help text-muted-foreground">
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    width="14"
-                    height="14"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <circle cx="12" cy="12" r="10"></circle>
-                    <line x1="12" y1="16" x2="12" y2="12"></line>
-                    <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                  </svg>
-                </span>
-                <div className="absolute left-0 top-6 z-[100] hidden w-64 rounded-md border bg-background p-3 text-xs text-foreground shadow-lg group-hover:block">
-                  <p>{column.description}</p>
-                  <p className="mt-1 font-medium">Type: {column._type}</p>
-                  {column.schema && <p className="mt-1 text-xs">Schema provided</p>}
+            <div className="px-3 py-2 text-sm font-semibold">Filename</div>
+            <div className="px-3 py-2 text-sm font-semibold">Document ID</div>
+            {allColumns.map(column => (
+              <div key={column.name} className="px-3 py-2 text-sm font-semibold">
+                <div className="group relative inline-flex items-center">
+                  {column.name}
+                  <span className="ml-1 cursor-help text-muted-foreground">
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="12" y1="16" x2="12" y2="12"></line>
+                      <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                    </svg>
+                  </span>
+                  <div className="absolute left-0 top-6 z-[100] hidden w-64 rounded-md border bg-background p-3 text-xs text-foreground shadow-lg group-hover:block">
+                    <p>{column.description}</p>
+                    <p className="mt-1 font-medium">Type: {column._type}</p>
+                    {column.schema && <p className="mt-1 text-xs">Schema provided</p>}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
+          {/* Sticky Actions column */}
+          <div className="sticky right-0 z-10 w-[120px] border-l bg-muted px-3 py-2 text-center text-sm font-semibold">
+            Actions
+          </div>
         </div>
 
         {/* Render dialogs separately */}
@@ -639,117 +663,174 @@ const DocumentList: React.FC<DocumentListProps> = ({
   return (
     <div className="w-full overflow-hidden rounded-md border shadow-sm">
       <DocumentListHeader />
-      <ScrollArea className="h-[calc(100vh-220px)]">
-        {filteredDocuments.map(doc => (
-          <div
-            key={doc.external_id}
-            onClick={() => handleDocumentClick(doc)}
-            className={`grid w-full items-center border-b ${
-              doc.external_id === selectedDocument?.external_id
-                ? "bg-primary/10 hover:bg-primary/15"
-                : "hover:bg-muted/70"
-            }`}
-            style={{
-              gridTemplateColumns: `48px minmax(200px, 350px) 100px 120px ${allColumns.map(() => "140px").join(" ")}`,
-            }}
-          >
-            <div className="flex items-center justify-center p-3">
-              <Checkbox
-                id={`doc-${doc.external_id}`}
-                checked={selectedDocuments.includes(doc.external_id)}
-                onCheckedChange={checked => handleCheckboxChange(checked, doc.external_id)}
-                onClick={e => e.stopPropagation()}
-                aria-label={`Select ${doc.filename || "document"}`}
-              />
-            </div>
-            <div className="flex items-center p-3">
-              <span className="truncate font-medium">{doc.filename || "N/A"}</span>
-            </div>
-            <div className="p-3">
-              <Badge variant="secondary" className="text-xs capitalize">
-                {doc.content_type.split("/")[0]}
-              </Badge>
-            </div>
-            <div className="p-3">
-              {doc.system_metadata?.status === "completed" ? (
-                <Badge
-                  variant="outline"
-                  className="flex items-center gap-1 border-green-200 bg-green-50 text-xs font-normal text-green-700"
-                >
-                  <span className="h-1.5 w-1.5 rounded-full bg-green-500"></span>
-                  Completed
-                </Badge>
-              ) : doc.system_metadata?.status === "failed" ? (
-                <Badge
-                  variant="outline"
-                  className="flex items-center gap-1 border-red-200 bg-red-50 text-xs font-normal text-red-700"
-                >
-                  <span className="h-1.5 w-1.5 rounded-full bg-red-500"></span>
-                  Failed
-                </Badge>
-              ) : (
-                <div className="group relative flex items-center">
-                  <Badge
-                    variant="outline"
-                    className="flex items-center gap-1 border-amber-200 bg-amber-50 text-xs font-normal text-amber-700"
-                  >
-                    <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500"></div>
-                    Processing
-                  </Badge>
-                  <div className="absolute -bottom-14 left-0 z-10 hidden whitespace-nowrap rounded-md border bg-popover p-2 text-xs text-foreground shadow-md group-hover:block">
-                    Document is being processed. Partial search available.
-                  </div>
-                </div>
-              )}
-            </div>
-            {/* Render metadata values for each column */}
-            {allColumns.map(column => (
-              <div key={column.name} className="truncate p-3" title={String(doc.metadata?.[column.name] ?? "")}>
-                {String(doc.metadata?.[column.name] ?? "-")}
-              </div>
-            ))}
-          </div>
-        ))}
-
-        {filteredDocuments.length === 0 && documents.length > 0 && (
-          <div className="flex flex-col items-center justify-center p-12 text-center">
-            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-              <Filter className="text-muted-foreground" />
-            </div>
-            <p className="text-muted-foreground">No documents match the current filters.</p>
-            <Button variant="link" className="mt-2" onClick={() => setFilterValues({})}>
-              Clear all filters
-            </Button>
-          </div>
-        )}
-
-        {documents.length === 0 && (
-          <div className="flex flex-col items-center justify-center p-12 text-center">
-            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="24"
-                height="24"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="text-muted-foreground"
+      <div className="relative overflow-x-auto">
+        <ScrollArea className="h-[calc(100vh-220px)]">
+          {filteredDocuments.map(doc => (
+            <div
+              key={doc.external_id}
+              onClick={() => handleDocumentClick(doc)}
+              className={`flex w-full items-center border-b ${
+                doc.external_id === selectedDocument?.external_id
+                  ? "bg-primary/10 hover:bg-primary/15"
+                  : "hover:bg-muted/70"
+              }`}
+            >
+              {/* Main scrollable content */}
+              <div
+                className="grid flex-1 items-center"
+                style={{
+                  gridTemplateColumns: `48px minmax(200px, 350px) 160px ${allColumns.map(() => "140px").join(" ")}`,
+                }}
               >
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                <polyline points="14 2 14 8 20 8"></polyline>
-                <line x1="9" y1="15" x2="15" y2="15"></line>
-              </svg>
+                <div className="flex items-center justify-center px-3 py-2">
+                  <Checkbox
+                    id={`doc-${doc.external_id}`}
+                    checked={selectedDocuments.includes(doc.external_id)}
+                    onCheckedChange={checked => handleCheckboxChange(checked, doc.external_id)}
+                    onClick={e => e.stopPropagation()}
+                    aria-label={`Select ${doc.filename || "document"}`}
+                  />
+                </div>
+                <div className="flex items-center gap-2 px-3 py-2">
+                  {/* Status dot next to filename */}
+                  <div className="group relative">
+                    {doc.system_metadata?.status === "completed" ? (
+                      <div className="h-2 w-2 rounded-full bg-green-500" />
+                    ) : doc.system_metadata?.status === "failed" ? (
+                      <div className="h-2 w-2 rounded-full bg-red-500" />
+                    ) : doc.system_metadata?.status === "uploading" ? (
+                      <div className="h-2 w-2 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+                    ) : (
+                      <div className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+                    )}
+                    <div className="absolute -top-8 left-1/2 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded-md border bg-popover px-2 py-1 text-xs text-foreground shadow-md group-hover:block">
+                      {doc.system_metadata?.status === "completed"
+                        ? "Completed"
+                        : doc.system_metadata?.status === "failed"
+                          ? "Failed"
+                          : doc.system_metadata?.status === "uploading"
+                            ? "Uploading"
+                            : "Processing"}
+                    </div>
+                  </div>
+                  <span className="truncate font-medium">{doc.filename || "N/A"}</span>
+                </div>
+                <div className="px-3 py-2">
+                  <button
+                    onClick={e => {
+                      e.stopPropagation();
+                      copyDocumentId(doc.external_id);
+                    }}
+                    className="group flex items-center gap-2 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
+                    title="Click to copy Document ID"
+                  >
+                    <span className="max-w-[120px] truncate">{doc.external_id}</span>
+                    {copiedDocumentId === doc.external_id ? (
+                      <Check className="h-3 w-3 text-green-500" />
+                    ) : (
+                      <Copy className="h-3 w-3 opacity-0 transition-opacity group-hover:opacity-100" />
+                    )}
+                  </button>
+                </div>
+                {/* Render metadata values for each column */}
+                {allColumns.map(column => (
+                  <div
+                    key={column.name}
+                    className="truncate px-3 py-2"
+                    title={String(doc.metadata?.[column.name] ?? "")}
+                  >
+                    {String(doc.metadata?.[column.name] ?? "-")}
+                  </div>
+                ))}
+              </div>
+              {/* Sticky Actions column */}
+              <div className="sticky right-0 z-10 flex w-[120px] items-center justify-end gap-1 border-l bg-background px-3 py-2">
+                {doc.content_type === "application/pdf" && onViewInPDFViewer && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={e => {
+                      e.stopPropagation();
+                      onViewInPDFViewer(doc.external_id);
+                    }}
+                    className="h-8 w-8 p-0"
+                    title="View in PDF Viewer"
+                  >
+                    <Eye className="h-4 w-4" />
+                  </Button>
+                )}
+                {onDownloadDocument && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={e => {
+                      e.stopPropagation();
+                      onDownloadDocument(doc.external_id);
+                    }}
+                    className="h-8 w-8 p-0"
+                    title="Download Document"
+                  >
+                    <Download className="h-4 w-4" />
+                  </Button>
+                )}
+                {onDeleteDocument && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={e => {
+                      e.stopPropagation();
+                      onDeleteDocument(doc.external_id);
+                    }}
+                    className="h-8 w-8 p-0 text-destructive hover:text-destructive"
+                    title="Delete Document"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                )}
+              </div>
             </div>
-            <p className="text-muted-foreground">No documents found in this view.</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Try uploading a document or selecting a different folder.
-            </p>
-          </div>
-        )}
-      </ScrollArea>
+          ))}
+
+          {filteredDocuments.length === 0 && documents.length > 0 && (
+            <div className="flex flex-col items-center justify-center p-12 text-center">
+              <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                <Filter className="text-muted-foreground" />
+              </div>
+              <p className="text-muted-foreground">No documents match the current filters.</p>
+              <Button variant="link" className="mt-2" onClick={() => setFilterValues({})}>
+                Clear all filters
+              </Button>
+            </div>
+          )}
+
+          {documents.length === 0 && (
+            <div className="flex flex-col items-center justify-center p-12 text-center">
+              <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="24"
+                  height="24"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="text-muted-foreground"
+                >
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                  <polyline points="14 2 14 8 20 8"></polyline>
+                  <line x1="9" y1="15" x2="15" y2="15"></line>
+                </svg>
+              </div>
+              <p className="text-muted-foreground">No documents found in this view.</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Try uploading a document or selecting a different folder.
+              </p>
+            </div>
+          )}
+        </ScrollArea>
+      </div>
 
       <div className="flex justify-between border-t p-3">
         {/* Filter stats */}
@@ -809,6 +890,6 @@ const DocumentList: React.FC<DocumentListProps> = ({
       </div>
     </div>
   );
-};
+});
 
 export default DocumentList;

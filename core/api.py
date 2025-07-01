@@ -884,6 +884,7 @@ async def list_documents(
     filters: Optional[Dict[str, Any]] = None,
     folder_name: Optional[Union[str, List[str]]] = Query(None),
     end_user_id: Optional[str] = None,
+    status: Optional[str] = None,
 ):
     """
     List accessible documents.
@@ -895,7 +896,7 @@ async def list_documents(
         filters: Optional metadata filters
         folder_name: Optional folder to scope the operation to
         end_user_id: Optional end-user ID to scope the operation to
-
+        status: Optional status to filter documents by ["processing", "completed", "failed"]
     Returns:
         List[Document]: List of accessible documents
     """
@@ -910,6 +911,8 @@ async def list_documents(
         system_filters["end_user_id"] = end_user_id
     if auth.app_id:
         system_filters["app_id"] = auth.app_id
+    if status:
+        system_filters["status"] = status
 
     return await document_service.db.get_documents(auth, skip, limit, filters, system_filters)
 

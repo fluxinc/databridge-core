@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..models.auth import AuthContext
 from ..models.documents import Document
@@ -74,7 +74,7 @@ class BaseDatabase(ABC):
         limit: int = 100,
         filters: Optional[Dict[str, Any]] = None,
         system_filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Document]:
+    ) -> Tuple[List[Document], int]:
         """
         List documents the user has access to.
         Supports pagination and filtering.

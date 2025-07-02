@@ -1,9 +1,9 @@
 import json
 import logging
 from datetime import UTC, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import Column, Index, String, and_, or_, select, text
+from sqlalchemy import Column, Index, String, and_, or_, select, text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -609,8 +609,9 @@ class PostgresDatabase(BaseDatabase):
         limit: int = 10000,
         filters: Optional[Dict[str, Any]] = None,
         system_filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Document]:
-        """List documents the user has access to."""
+        include_count: bool = True,
+    ) -> Tuple[List[Document], int]:
+        """List documents the user has access to. Optionally return total count for pagination."""
         try:
             async with self.async_session() as session:
                 # Build query
@@ -627,14 +628,20 @@ class PostgresDatabase(BaseDatabase):
                     where_clauses.append(f"({system_metadata_filter})")
 
                 final_where_clause = " AND ".join(where_clauses)
-                query = select(DocumentModel).where(text(final_where_clause))
+                
+                # Get total count if requested
+                count_query = select(func.count(DocumentModel.external_id)).where(text(final_where_clause))
+                count_result = await session.execute(count_query)
+                total_count = count_result.scalar()
 
+                # Get paginated documents
+                query = select(DocumentModel).where(text(final_where_clause))
                 query = query.offset(skip).limit(limit)
 
                 result = await session.execute(query)
                 doc_models = result.scalars().all()
 
-                return [
+                documents = [
                     Document(
                         external_id=doc.external_id,
                         owner=doc.owner,
@@ -651,9 +658,13 @@ class PostgresDatabase(BaseDatabase):
                     for doc in doc_models
                 ]
 
+                return documents, total_count
+
         except Exception as e:
             logger.error(f"Error listing documents: {str(e)}")
-            return []
+            return [], 0
+
+
 
     async def update_document(self, document_id: str, updates: Dict[str, Any], auth: AuthContext) -> bool:
         """Update document metadata if user has write access."""

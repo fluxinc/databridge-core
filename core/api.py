@@ -46,6 +46,8 @@ from core.routes.model_config import router as model_config_router
 from core.routes.models import router as models_router
 from core.services.telemetry import TelemetryService
 from core.services_init import document_service
+from pydantic import BaseModel
+
 
 # Set up logging configuration for Docker environment
 setup_logging()
@@ -101,6 +103,9 @@ class PerformanceTracker:
             logger.info(additional_info)
         logger.info("=" * (len(self.operation_name) + 31))
 
+class DocumentListResponseType(BaseModel):
+    documents: List[Document]
+    metadata: Dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # Application instance & core initialisation (moved lifespan, rest unchanged)
@@ -876,7 +881,7 @@ async def agent_query(
     return response
 
 
-@app.post("/documents", response_model=List[Document])
+@app.post("/documents", response_model=DocumentListResponseType)
 async def list_documents(
     auth: AuthContext = Depends(verify_token),
     skip: int = 0,
@@ -887,7 +892,7 @@ async def list_documents(
     status: Optional[str] = None,
 ):
     """
-    List accessible documents.
+    List accessible documents with pagination metadata.
 
     Args:
         auth: Authentication context
@@ -898,7 +903,7 @@ async def list_documents(
         end_user_id: Optional end-user ID to scope the operation to
         status: Optional status to filter documents by ["processing", "completed", "failed"]
     Returns:
-        List[Document]: List of accessible documents
+        Dict containing documents and pagination metadata
     """
     # Create system filters for folder and user scoping
     system_filters = {}
@@ -914,7 +919,26 @@ async def list_documents(
     if status:
         system_filters["status"] = status
 
-    return await document_service.db.get_documents(auth, skip, limit, filters, system_filters)
+    documents, total_count = await document_service.db.get_documents(auth, skip, limit, filters, system_filters)
+    
+    # Calculate pagination metadata
+    current_page = skip // limit if limit > 0 else 0
+    total_pages = (total_count + limit - 1) // limit if limit > 0 else 1
+    
+    return {
+        "documents": documents,
+        "metadata": {
+            "total": total_count,
+            "skip": skip,
+            "limit": limit,
+            "current_page": current_page,
+            "total_pages": total_pages,
+            "has_next": skip + limit < total_count,
+            "has_previous": skip > 0
+        }
+    }
+
+
 
 
 @app.get("/documents/{document_id}", response_model=Document)
